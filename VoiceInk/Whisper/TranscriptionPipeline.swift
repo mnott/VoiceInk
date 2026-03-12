@@ -167,7 +167,7 @@ class TranscriptionPipeline {
                 let globalAutoEnter = UserDefaults.standard.bool(forKey: "AutoEnterAfterTranscription")
                 let powerModeAutoEnter = (PowerModeManager.shared.currentActiveConfiguration?.isAutoSendEnabled == true)
                 if globalAutoEnter || powerModeAutoEnter {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
                         CursorPaster.pressEnter()
                     }
                 }
