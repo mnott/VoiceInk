@@ -20,7 +20,32 @@
 
 ---
 
-VoiceInk is a native macOS application that transcribes what you say to text almost instantly. You can find all the information and download the app from [here](https://tryvoiceink.com). 
+> **Fork Notice** - This is a personal fork of [Beingpax/VoiceInk](https://github.com/Beingpax/VoiceInk) with the following additions:
+>
+> ### Changes in this fork
+>
+> - **Auto Enter after transcription** - A global toggle (AI Models > Settings gear) that automatically presses Enter after the transcribed text is pasted. Useful for chat applications, terminal prompts, or any context where you want hands-free send-after-dictation. Works alongside the existing Power Mode auto-send feature.
+> - **LOCAL_BUILD marker** - An orange "LOCAL" badge in the sidebar header to visually distinguish self-built versions from official releases.
+>
+> ### Building
+>
+> ```shell
+> make local
+> ```
+>
+> This produces `~/Downloads/VoiceInk.app` with ad-hoc signing and the `LOCAL_BUILD` flag enabled (bypasses licensing for local builds). See [BUILDING.md](BUILDING.md) for prerequisites (Xcode, whisper.cpp xcframework).
+>
+> ### Staying in sync
+>
+> ```shell
+> git fetch upstream
+> git merge upstream/main
+> make local
+> ```
+
+---
+
+VoiceInk is a native macOS application that transcribes what you say to text almost instantly. You can find all the information and download the app from [here](https://tryvoiceink.com).
 
 ![VoiceInk Mac App](https://github.com/user-attachments/assets/12367379-83e7-48a6-b52c-4488a6a04bba)
 
