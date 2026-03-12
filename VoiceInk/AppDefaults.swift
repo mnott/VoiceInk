@@ -25,6 +25,7 @@ enum AppDefaults {
             "RemoveFillerWords": true,
             "SelectedLanguage": "en",
             "AppendTrailingSpace": true,
+            "AutoEnterAfterTranscription": false,
             "RecorderType": "mini",
 
             // Cleanup

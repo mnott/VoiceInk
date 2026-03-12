@@ -93,6 +93,15 @@ struct ContentView: View {
                         Text("VoiceInk")
                             .font(.system(size: 14, weight: .semibold))
 
+                        #if LOCAL_BUILD
+                        Text("LOCAL")
+                            .font(.system(size: 9, weight: .heavy))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 2)
+                            .background(Color.orange)
+                            .cornerRadius(4)
+                        #else
                         if case .licensed = licenseViewModel.licenseState {
                             Text("PRO")
                                 .font(.system(size: 9, weight: .heavy))
@@ -102,6 +111,7 @@ struct ContentView: View {
                                 .background(Color.blue)
                                 .cornerRadius(4)
                         }
+                        #endif
 
                         Spacer()
                     }

@@ -164,8 +164,9 @@ class TranscriptionPipeline {
                 let appendSpace = UserDefaults.standard.bool(forKey: "AppendTrailingSpace")
                 CursorPaster.pasteAtCursor(textToPaste + (appendSpace ? " " : ""))
 
-                let powerMode = PowerModeManager.shared
-                if let activeConfig = powerMode.currentActiveConfiguration, activeConfig.isAutoSendEnabled {
+                let globalAutoEnter = UserDefaults.standard.bool(forKey: "AutoEnterAfterTranscription")
+                let powerModeAutoEnter = (PowerModeManager.shared.currentActiveConfiguration?.isAutoSendEnabled == true)
+                if globalAutoEnter || powerModeAutoEnter {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                         CursorPaster.pressEnter()
                     }

@@ -6,6 +6,7 @@ struct ModelSettingsView: View {
     @AppStorage("IsTextFormattingEnabled") private var isTextFormattingEnabled = true
     @AppStorage("IsVADEnabled") private var isVADEnabled = true
     @AppStorage("AppendTrailingSpace") private var appendTrailingSpace = true
+    @AppStorage("AutoEnterAfterTranscription") private var autoEnterAfterTranscription = false
     @AppStorage("PrewarmModelOnWake") private var prewarmModelOnWake = true
     @State private var customPrompt: String = ""
     @State private var isEditing: Bool = false
@@ -69,6 +70,11 @@ struct ModelSettingsView: View {
 
             Toggle(isOn: $appendTrailingSpace) {
                 Text("Add Space After Paste")
+            }
+            .toggleStyle(.switch)
+
+            Toggle(isOn: $autoEnterAfterTranscription) {
+                Text("Auto Enter after transcription")
             }
             .toggleStyle(.switch)
 
