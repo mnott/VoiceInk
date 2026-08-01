@@ -20,6 +20,36 @@
 
 ---
 
+> **Fork Notice** - This is a personal fork of [Beingpax/VoiceInk](https://github.com/Beingpax/VoiceInk), currently rebased on upstream **v2.1**.
+>
+> ### Changes in this fork
+>
+> - **Auto Enter After Paste** - A global toggle (AI Models > Settings > Advanced) that presses Return after the transcribed text is pasted, in every app. Upstream only offers this per Mode via the *Auto Send Key* picker; this is the always-on fallback. A Mode that defines its own auto-send key keeps it — the global toggle only fills in when the Mode's key is *None*.
+> - **No update nag in local builds** - Sparkle cannot update an ad-hoc signed build, so `LOCAL_BUILD` turns off automatic update checks. Manual *Check for Updates…* still works.
+> - **LOCAL build badge** - An orange `LOCAL <version>` badge at the bottom of the sidebar so a self-built copy is never mistaken for an official release.
+>
+> The licensing bypass is *not* part of this fork - it is upstream's own `LOCAL_BUILD` compilation flag, enabled by `make local`.
+>
+> ### Building
+>
+> ```shell
+> make local
+> ```
+>
+> This produces `~/Downloads/VoiceInk.app` with ad-hoc signing and the `LOCAL_BUILD` flag enabled. See [BUILDING.md](BUILDING.md) for prerequisites (Xcode, whisper.cpp xcframework).
+>
+> ### Staying in sync
+>
+> Fork changes are kept as a thin set of commits on top of `upstream/main`, so a rebase is preferred over a merge:
+>
+> ```shell
+> git fetch upstream
+> git rebase upstream/main
+> make local
+> ```
+
+---
+
 VoiceInk is a native macOS application that transcribes what you say to text almost instantly. You can find all the information and download the app from [here](https://tryvoiceink.com). 
 
 ![VoiceInk Mac App](https://github.com/user-attachments/assets/12367379-83e7-48a6-b52c-4488a6a04bba)
