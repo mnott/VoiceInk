@@ -40,7 +40,7 @@
 >
 > ### Staying in sync
 >
-> Fork changes are kept as a thin set of commits on top of `upstream/main`, so a rebase is preferred over a merge:
+> Fork changes are kept as a thin set of commits on top of `upstream/main`, so a rebase is preferred over a merge. See **[UPGRADING.md](UPGRADING.md)** for the full runbook — including the TCC permission reset that is required whenever the installed app is replaced.
 >
 > ```shell
 > git fetch upstream
