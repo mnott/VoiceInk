@@ -25,6 +25,11 @@ struct AppSidebar: View {
 
             sidebarSection(ViewType.secondaryItems)
                 .padding(.bottom, 14)
+
+            #if LOCAL_BUILD
+                LocalBuildBadge()
+                    .padding(.bottom, 12)
+            #endif
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -190,6 +195,27 @@ private struct SidebarItemButton: View {
         Color(nsColor: .alternateSelectedControlTextColor)
     }
 }
+
+#if LOCAL_BUILD
+    /// Marks self-built copies so they are never mistaken for an official release.
+    private struct LocalBuildBadge: View {
+        private var version: String {
+            Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        }
+
+        var body: some View {
+            Text("LOCAL \(version)")
+                .font(.system(size: 10, weight: .heavy))
+                .foregroundColor(.white)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(Color.orange.opacity(0.85))
+                )
+        }
+    }
+#endif
 
 private struct SidebarIconTile: View {
     let systemName: String
