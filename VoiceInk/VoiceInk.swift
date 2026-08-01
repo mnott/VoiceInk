@@ -474,6 +474,11 @@ class UpdaterViewModel: ObservableObject {
         updaterController = SPUStandardUpdaterController(
             startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
 
+        #if LOCAL_BUILD
+            // Sparkle cannot update an ad-hoc signed local build, so never nag about releases.
+            updaterController.updater.automaticallyChecksForUpdates = false
+        #endif
+
         automaticallyChecksForUpdates = updaterController.updater.automaticallyChecksForUpdates
 
         updaterController.updater.publisher(for: \.canCheckForUpdates)
