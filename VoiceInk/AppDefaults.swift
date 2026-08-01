@@ -39,6 +39,7 @@ enum AppDefaults {
             "IsVADEnabled": true,
             "SelectedLanguage": "en",
             "AppendTrailingSpace": true,
+            "AutoEnterAfterTranscription": false,
             "RecorderType": "mini",
             RecorderDisplaySettingsKeys.showLiveTranscript: true,
 

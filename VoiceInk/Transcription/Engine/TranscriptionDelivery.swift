@@ -163,7 +163,13 @@ final class TranscriptionDelivery {
 
         let pasteTask = CursorPaster.startPasteAtCursor(pastedText)
 
-        let autoSendKey = output.outputMode == .paste ? output.autoSendKey : .none
+        var autoSendKey: AutoSendKey = output.outputMode == .paste ? output.autoSendKey : .none
+        // Global fallback: send Return unless the active mode already picked a key.
+        if autoSendKey == .none, output.outputMode == .paste,
+            UserDefaults.standard.bool(forKey: "AutoEnterAfterTranscription")
+        {
+            autoSendKey = .enter
+        }
         Task { @MainActor in
             _ = await pasteTask.value
 

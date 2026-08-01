@@ -142,6 +142,7 @@ private struct EnhancementModelSettingsView: View {
 private struct AdvancedModelSettingsSection: View {
     @AppStorage("IsVADEnabled") private var isVADEnabled = true
     @AppStorage("AppendTrailingSpace") private var appendTrailingSpace = true
+    @AppStorage("AutoEnterAfterTranscription") private var autoEnterAfterTranscription = false
     @AppStorage("PrewarmModelOnWake") private var prewarmModelOnWake = true
 
     var body: some View {
@@ -150,6 +151,16 @@ private struct AdvancedModelSettingsSection: View {
                 HStack(spacing: 4) {
                     Text("Add Space After Paste")
                     InfoTip("Add a trailing space after pasted transcription output.")
+                }
+            }
+            .toggleStyle(.switch)
+
+            Toggle(isOn: $autoEnterAfterTranscription) {
+                HStack(spacing: 4) {
+                    Text("Auto Enter After Paste")
+                    InfoTip(
+                        "Press Return after pasting, in every app. Modes that define their own auto-send key keep it."
+                    )
                 }
             }
             .toggleStyle(.switch)
