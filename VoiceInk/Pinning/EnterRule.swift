@@ -14,18 +14,30 @@ struct PinnedDestinationEnterRule: Codable, Identifiable, Equatable {
     /// instead of being entered as text. Defaults to false for every app: like
     /// `appendReturn`, there is no implicit per-app default, only what this list shows.
     var sendInsertPrefix: Bool
+    /// Appends a single space after the dictated text when it is NOT being submitted. Dictating
+    /// several sentences into the same field otherwise runs them together, leaving the user to
+    /// type the separator by hand every time. Meaningless when `appendReturn` is on - the text
+    /// is submitted rather than continued - so delivery ignores it in that case.
+    var appendSpace: Bool
 
     var id: String { bundleIdentifier }
 
-    init(bundleIdentifier: String, appName: String, appendReturn: Bool, sendInsertPrefix: Bool = false) {
+    init(
+        bundleIdentifier: String,
+        appName: String,
+        appendReturn: Bool,
+        sendInsertPrefix: Bool = false,
+        appendSpace: Bool = true
+    ) {
         self.bundleIdentifier = bundleIdentifier
         self.appName = appName
         self.appendReturn = appendReturn
         self.sendInsertPrefix = sendInsertPrefix
+        self.appendSpace = appendSpace
     }
 
     private enum CodingKeys: String, CodingKey {
-        case bundleIdentifier, appName, appendReturn, sendInsertPrefix
+        case bundleIdentifier, appName, appendReturn, sendInsertPrefix, appendSpace
     }
 
     // Custom decode so rules persisted before `sendInsertPrefix` existed still decode
@@ -39,6 +51,7 @@ struct PinnedDestinationEnterRule: Codable, Identifiable, Equatable {
         appName = try container.decode(String.self, forKey: .appName)
         appendReturn = try container.decode(Bool.self, forKey: .appendReturn)
         sendInsertPrefix = try container.decodeIfPresent(Bool.self, forKey: .sendInsertPrefix) ?? false
+        appendSpace = try container.decodeIfPresent(Bool.self, forKey: .appendSpace) ?? true
     }
 }
 
@@ -64,6 +77,13 @@ enum PinnedDestinationEnterRuleStore {
         false
     }
 
+    /// Unlike the other two, this defaults ON: continuing to dictate into the same field is the
+    /// common case, and running two dictations together with no separator is never what the
+    /// user meant. Turning it off is for fields where a trailing space is actively wrong.
+    static func defaultAppendSpace(forBundleIdentifier _: String) -> Bool {
+        true
+    }
+
     /// Resolves the effective "append Return" behavior for a bundle id: an explicit
     /// rule wins, otherwise the built-in default for that bundle id applies.
     static func appendReturn(
@@ -87,6 +107,27 @@ enum PinnedDestinationEnterRuleStore {
             return rule.sendInsertPrefix
         }
         return defaultSendInsertPrefix(forBundleIdentifier: bundleIdentifier)
+    }
+
+    /// Resolves the effective "append a trailing space" behavior, mirroring the two above.
+    static func appendSpace(
+        forBundleIdentifier bundleIdentifier: String,
+        rules: [PinnedDestinationEnterRule]
+    ) -> Bool {
+        if let rule = rules.first(where: { $0.bundleIdentifier == bundleIdentifier }) {
+            return rule.appendSpace
+        }
+        return defaultAppendSpace(forBundleIdentifier: bundleIdentifier)
+    }
+
+    /// The text to actually deliver: the transcript, plus a trailing space when one is wanted.
+    /// A space is only ever added when the text is NOT being submitted - after a Return the
+    /// field is gone, so a trailing space would either vanish or land at the start of whatever
+    /// comes next. Kept pure and separate from delivery so both the AppleScript and the
+    /// accessibility paths append identically rather than each re-deriving the rule.
+    static func deliveredText(_ text: String, appendReturn: Bool, appendSpace: Bool) -> String {
+        guard !appendReturn, appendSpace else { return text }
+        return text + " "
     }
 
     static func decode(_ data: Data) -> [PinnedDestinationEnterRule] {
@@ -134,10 +175,21 @@ final class PinnedDestinationEnterRulesManager: ObservableObject {
         PinnedDestinationEnterRuleStore.sendInsertPrefix(forBundleIdentifier: bundleIdentifier, rules: rules)
     }
 
-    func setRule(bundleIdentifier: String, appName: String, appendReturn: Bool, sendInsertPrefix: Bool) {
+    func appendSpace(forBundleIdentifier bundleIdentifier: String) -> Bool {
+        PinnedDestinationEnterRuleStore.appendSpace(forBundleIdentifier: bundleIdentifier, rules: rules)
+    }
+
+    func setRule(
+        bundleIdentifier: String,
+        appName: String,
+        appendReturn: Bool,
+        sendInsertPrefix: Bool,
+        appendSpace: Bool
+    ) {
         if let index = rules.firstIndex(where: { $0.bundleIdentifier == bundleIdentifier }) {
             rules[index].appendReturn = appendReturn
             rules[index].sendInsertPrefix = sendInsertPrefix
+            rules[index].appendSpace = appendSpace
             rules[index].appName = appName
         } else {
             rules.append(
@@ -145,7 +197,8 @@ final class PinnedDestinationEnterRulesManager: ObservableObject {
                     bundleIdentifier: bundleIdentifier,
                     appName: appName,
                     appendReturn: appendReturn,
-                    sendInsertPrefix: sendInsertPrefix
+                    sendInsertPrefix: sendInsertPrefix,
+                    appendSpace: appendSpace
                 ))
         }
         persist()

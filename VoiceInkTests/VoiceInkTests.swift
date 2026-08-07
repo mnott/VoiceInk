@@ -449,7 +449,9 @@ struct PinnedDestinationITermDeliveryStepsTests {
         let steps = PinnedDestinationManager.iTermDeliverySteps(
             textLiteral: textLiteral, sendInsertPrefix: true)
         #expect(steps.count == 2)
-        #expect(steps[0].statement == "write text \"i\" newline no")
+        // `i` followed by DEL, so the pair is self-cancelling whichever mode the target
+        // started in - see `insertModePrefixStatement`.
+        #expect(steps[0].statement == "write text (\"i\" & (character id 127)) newline no")
         #expect(steps[0].role == .insertModePrefix)
         #expect(steps[0].settleDelaySeconds > 0)
         #expect(steps[1].statement == "write text \(textLiteral) newline no")
@@ -458,6 +460,78 @@ struct PinnedDestinationITermDeliveryStepsTests {
     }
 }
 
+
+// MARK: - Pinned Destination: trailing space
+
+struct PinnedDestinationTrailingSpaceTests {
+    @Test func aSpaceIsAddedWhenTheTextIsNotSubmitted() {
+        let text = PinnedDestinationEnterRuleStore.deliveredText("hello", appendReturn: false, appendSpace: true)
+        #expect(text == "hello ")
+    }
+
+    @Test func noSpaceIsAddedWhenTheTextIsSubmitted() {
+        // After a Return the field is gone, so a trailing space would either vanish or
+        // end up in front of whatever the user types next.
+        let text = PinnedDestinationEnterRuleStore.deliveredText("hello", appendReturn: true, appendSpace: true)
+        #expect(text == "hello")
+    }
+
+    @Test func noSpaceWhenTurnedOff() {
+        #expect(PinnedDestinationEnterRuleStore.deliveredText("hello", appendReturn: false, appendSpace: false) == "hello")
+    }
+
+    @Test func rulesPersistedBeforeThisOptionExistedDefaultToAddingASpace() throws {
+        // Decoding must not throw on the missing key - the synthesized Decodable would,
+        // and a throw here silently drops the user's entire stored rule list.
+        let legacy = Data(
+            #"[{"bundleIdentifier":"com.example.app","appName":"Example","appendReturn":true}]"#.utf8)
+        let rules = PinnedDestinationEnterRuleStore.decode(legacy)
+        #expect(rules.count == 1)
+        #expect(rules.first?.appendSpace == true)
+        #expect(rules.first?.sendInsertPrefix == false)
+    }
+}
+
+// MARK: - Pinned Destination: iTerm2 background color parsing
+
+struct PinnedDestinationITermColorTests {
+    @Test func parsesThreeComponents() {
+        let color = PinnedDestinationManager.parseITermColor("11999,3999,4000")
+        #expect(color == PinnedDestinationManager.ITermColor(red: 11999, green: 3999, blue: 4000))
+    }
+
+    @Test func parsesAllZeroesWithoutCollapsingThem() {
+        // The reason the script formats and joins the components itself: AppleScript
+        // coerces the color list {0, 0, 0} to the string "000", which cannot be split
+        // back into three components. A black background is extremely common, so this
+        // is the case that would silently break restoring a real user's color.
+        let color = PinnedDestinationManager.parseITermColor("0,0,0")
+        #expect(color == PinnedDestinationManager.ITermColor(red: 0, green: 0, blue: 0))
+    }
+
+    @Test func toleratesSurroundingWhitespace() {
+        let color = PinnedDestinationManager.parseITermColor(" 100 , 200 , 300 ")
+        #expect(color == PinnedDestinationManager.ITermColor(red: 100, green: 200, blue: 300))
+    }
+
+    @Test func rejectsAnythingUnparseable() {
+        // Every one of these must fail rather than guess: without a trustworthy original
+        // color the caller skips tinting entirely, which is far better than applying a
+        // tint it could never undo.
+        #expect(PinnedDestinationManager.parseITermColor(nil) == nil)
+        #expect(PinnedDestinationManager.parseITermColor("") == nil)
+        #expect(PinnedDestinationManager.parseITermColor("000") == nil)
+        #expect(PinnedDestinationManager.parseITermColor("1,2") == nil)
+        #expect(PinnedDestinationManager.parseITermColor("1,2,3,4") == nil)
+        #expect(PinnedDestinationManager.parseITermColor("red,green,blue") == nil)
+    }
+
+    @Test func buildsASettableAppleScriptStatement() {
+        let statement = PinnedDestinationManager.setBackgroundColorStatement(
+            PinnedDestinationManager.ITermColor(red: 1, green: 2, blue: 3))
+        #expect(statement == "set background color to {1, 2, 3}")
+    }
+}
 
 // MARK: - Pinned Destination: iTerm2 write result classification
 

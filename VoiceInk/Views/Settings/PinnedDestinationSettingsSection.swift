@@ -10,8 +10,8 @@ import SwiftUI
 struct PinnedDestinationSettingsSection: View {
     @ObservedObject private var rulesManager = PinnedDestinationEnterRulesManager.shared
     @State private var selectedBundleIdentifier: String = ""
-    @AppStorage(PinnedDestinationSettingsKeys.markPinnedITermSessionWithBadge)
-    private var markPinnedITermSessionWithBadge = false
+    @AppStorage(PinnedDestinationSettingsKeys.highlightPinnedITermSession)
+    private var highlightPinnedITermSession = false
 
     private var addableApps: [NSRunningApplication] {
         NSWorkspace.shared.runningApplications
@@ -28,17 +28,17 @@ struct PinnedDestinationSettingsSection: View {
                         .controlSize(.small)
                 }
 
-                Toggle("Mark Pinned iTerm2 Session With a Badge", isOn: $markPinnedITermSessionWithBadge)
+                Toggle("Tint Pinned iTerm2 Session", isOn: $highlightPinnedITermSession)
                     .toggleStyle(.switch)
                     .controlSize(.small)
                     .help(
-                        "Requires the iTerm2 profile's Badge Text (Settings > Profiles > General > Badge) to include \\(user.voiceink_pinned) - VoiceInk can only set that variable's value, not the badge itself"
+                        "Give the pinned pane a pale green background while it is pinned, matching the menu bar icon, so you can spot it among many panes. The original color is restored when the pin ends."
                     )
             } header: {
                 Text("Pinned Destination")
             } footer: {
                 Text(
-                    "Focus something you can type into, then use this shortcut to pin it. Dictation is then delivered there without switching focus, until you toggle the pin off. When the destination is an iTerm2 session, marking it with a badge (above) can help you spot which pane is pinned when several are open - it is reverted automatically when the pin changes or clears, and only appears if your iTerm2 profile's badge is configured to show it."
+                    "Focus something you can type into, then use this shortcut to pin it. Dictation is then delivered there without switching focus, until you toggle the pin off. When the destination is an iTerm2 session, tinting it (above) can help you spot which pane is pinned when several are open - the original background color is captured first and put back automatically when the pin changes or clears."
                 )
                 .font(.caption)
                 .foregroundColor(.secondary)
@@ -58,7 +58,8 @@ struct PinnedDestinationSettingsSection: View {
                                                 bundleIdentifier: rule.bundleIdentifier,
                                                 appName: rule.appName,
                                                 appendReturn: rule.appendReturn,
-                                                sendInsertPrefix: $0
+                                                sendInsertPrefix: $0,
+                                                appendSpace: rule.appendSpace
                                             )
                                         }
                                     )
@@ -66,7 +67,7 @@ struct PinnedDestinationSettingsSection: View {
                                 .toggleStyle(.switch)
                                 .controlSize(.small)
                                 .help(
-                                    "Switch this app into typing mode before sending dictated text, so it is entered as text instead of being interpreted as commands"
+                                    "Switch this app into typing mode before sending dictated text, so it is entered as text instead of being interpreted as commands. Safe either way - if it was already in typing mode, nothing is left behind."
                                 )
 
                                 Toggle(
@@ -78,7 +79,8 @@ struct PinnedDestinationSettingsSection: View {
                                                 bundleIdentifier: rule.bundleIdentifier,
                                                 appName: rule.appName,
                                                 appendReturn: $0,
-                                                sendInsertPrefix: rule.sendInsertPrefix
+                                                sendInsertPrefix: rule.sendInsertPrefix,
+                                                appendSpace: rule.appendSpace
                                             )
                                         }
                                     )
@@ -86,6 +88,28 @@ struct PinnedDestinationSettingsSection: View {
                                 .toggleStyle(.switch)
                                 .controlSize(.small)
                                 .help("Press Return after delivering dictated text to this app, to submit it automatically")
+
+                                Toggle(
+                                    "Append Space",
+                                    isOn: Binding(
+                                        get: { rule.appendSpace },
+                                        set: {
+                                            rulesManager.setRule(
+                                                bundleIdentifier: rule.bundleIdentifier,
+                                                appName: rule.appName,
+                                                appendReturn: rule.appendReturn,
+                                                sendInsertPrefix: rule.sendInsertPrefix,
+                                                appendSpace: $0
+                                            )
+                                        }
+                                    )
+                                )
+                                .toggleStyle(.switch)
+                                .controlSize(.small)
+                                .disabled(rule.appendReturn)
+                                .help(
+                                    "Add a space after the dictated text so you can keep dictating the next sentence without typing one yourself. Not used when Submit With Return is on."
+                                )
 
                                 Button {
                                     rulesManager.removeRule(bundleIdentifier: rule.bundleIdentifier)
@@ -135,7 +159,7 @@ struct PinnedDestinationSettingsSection: View {
                 Text("Delivery Options")
             } footer: {
                 Text(
-                    "By default, VoiceInk only inserts the dictated text. Add an app here to also switch it into typing mode first, submit with Return afterward, or both. Whether either works depends on the app, so neither is guaranteed for every one."
+                    "Add an app here to control how dictated text is delivered to it: switch it into typing mode first, submit with Return afterward, and whether to leave a trailing space so you can keep dictating. A space is added by default when the text is not submitted. Whether the first two work depends on the app, so neither is guaranteed for every one."
                 )
                 .font(.caption)
                 .foregroundColor(.secondary)
@@ -147,6 +171,8 @@ struct PinnedDestinationSettingsSection: View {
         rule.appendReturn != PinnedDestinationEnterRuleStore.defaultAppendReturn(forBundleIdentifier: rule.bundleIdentifier)
             || rule.sendInsertPrefix
                 != PinnedDestinationEnterRuleStore.defaultSendInsertPrefix(forBundleIdentifier: rule.bundleIdentifier)
+            || rule.appendSpace
+                != PinnedDestinationEnterRuleStore.defaultAppendSpace(forBundleIdentifier: rule.bundleIdentifier)
     }
 
     private func addSelectedApp() {
@@ -162,7 +188,8 @@ struct PinnedDestinationSettingsSection: View {
             appName: app.localizedName ?? bundleIdentifier,
             appendReturn: PinnedDestinationEnterRuleStore.defaultAppendReturn(forBundleIdentifier: bundleIdentifier),
             sendInsertPrefix: PinnedDestinationEnterRuleStore.defaultSendInsertPrefix(
-                forBundleIdentifier: bundleIdentifier)
+                forBundleIdentifier: bundleIdentifier),
+            appendSpace: PinnedDestinationEnterRuleStore.defaultAppendSpace(forBundleIdentifier: bundleIdentifier)
         )
         selectedBundleIdentifier = ""
     }

@@ -23,57 +23,73 @@ final class PinnedDestinationManager: ObservableObject {
     private static let textishRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox"]
 
     private init() {
-        pinned = Self.restorePersistedPin()
-        logger.notice(
-            "PinnedDestinationManager ready. restoredPin=\(self.pinned?.displayLabel ?? "none", privacy: .public)")
-    }
-
-    // MARK: - Pin persistence
-
-    // Only an iTerm2 session pin survives an app restart, and it is the only one that
-    // CAN: its session id stays valid as long as the pane lives, so the pin can be
-    // rebuilt from a string. The two AX cases are built around an AXUIElement, which is
-    // a live handle into another process with no serializable form - persisting those
-    // would mean inventing a re-resolution story for a target the user pinned in a
-    // previous launch, which is not the same target any more.
-    //
-    // This exists because losing the pin on every launch is not a small annoyance: when
-    // no pin is set, dictation silently falls back to whatever the mode's normal output
-    // is, which for a Custom Command mode can be a clipboard paste that never submits.
-    // The user then sees text arrive with no Return and reasonably reads it as the pin
-    // being broken, when in fact no pin was active at all.
-    private enum PinPersistenceKeys {
-        static let iTermSession = "PinnedDestinationITermSession"
-    }
-
-    private struct PersistedITermPin: Codable {
-        let id: String
-        let appName: String
-        let sessionName: String?
-    }
-
-    private static func restorePersistedPin(from defaults: UserDefaults = .standard) -> PinnedTarget? {
-        guard let data = defaults.data(forKey: PinPersistenceKeys.iTermSession),
-            let stored = try? JSONDecoder().decode(PersistedITermPin.self, from: data)
-        else {
-            return nil
+        // A pin deliberately does NOT survive a restart: it names a live target the user
+        // chose in a session that is over, and silently resurrecting it would send the
+        // next dictation somewhere they are no longer looking.
+        Task { [weak self] in
+            await self?.restoreOrphanedITermTintIfNeeded()
         }
-        // Liveness is deliberately NOT checked here: it needs an AppleScript round-trip
-        // to iTerm2, and a pane that is merely slow to answer during launch must not
-        // cost the user their pin. Delivery already verifies liveness and clears a
-        // genuinely dead pin with a visible message.
-        return .iTermSession(id: stored.id, appName: stored.appName, sessionName: stored.sessionName)
     }
 
-    private func persistPin(_ target: PinnedTarget?, to defaults: UserDefaults = .standard) {
-        guard case .iTermSession(let id, let appName, let sessionName)? = target else {
-            defaults.removeObject(forKey: PinPersistenceKeys.iTermSession)
+    // MARK: - Orphaned tint recovery
+
+    // The pin itself is not persisted, but the TINT has to be: it is a change made to
+    // something outside this app, and the process that owes the user a restore can be
+    // killed at any moment - crash, force quit, a rebuild during development. Without
+    // this, a pane keeps a green background with nothing on screen explaining why and no
+    // way to undo it short of the user hunting through iTerm2's own color settings.
+    //
+    // So the marking (session id plus the color captured BEFORE tinting) is written to
+    // disk the moment it is applied and removed the moment it is reverted. On launch, a
+    // record still present means the previous run never got to revert it, and this puts
+    // the original color back.
+    private enum TintPersistenceKeys {
+        static let activeMarking = "PinnedDestinationITermTint"
+    }
+
+    private struct PersistedTint: Codable {
+        let sessionID: String
+        let red: Int
+        let green: Int
+        let blue: Int
+    }
+
+    private func persistActiveMarking(_ marking: (sessionID: String, previousBackgroundColor: ITermColor)?) {
+        let defaults = UserDefaults.standard
+        guard let marking else {
+            defaults.removeObject(forKey: TintPersistenceKeys.activeMarking)
             return
         }
 
-        let stored = PersistedITermPin(id: id, appName: appName, sessionName: sessionName)
+        let stored = PersistedTint(
+            sessionID: marking.sessionID,
+            red: marking.previousBackgroundColor.red,
+            green: marking.previousBackgroundColor.green,
+            blue: marking.previousBackgroundColor.blue
+        )
         guard let data = try? JSONEncoder().encode(stored) else { return }
-        defaults.set(data, forKey: PinPersistenceKeys.iTermSession)
+        defaults.set(data, forKey: TintPersistenceKeys.activeMarking)
+    }
+
+    private func restoreOrphanedITermTintIfNeeded() async {
+        let defaults = UserDefaults.standard
+        guard let data = defaults.data(forKey: TintPersistenceKeys.activeMarking),
+            let stored = try? JSONDecoder().decode(PersistedTint.self, from: data)
+        else {
+            return
+        }
+
+        // Cleared first, unconditionally: if the pane is already gone the restore below
+        // can never succeed, and a record that outlives its session would otherwise be
+        // retried on every single launch forever.
+        defaults.removeObject(forKey: TintPersistenceKeys.activeMarking)
+
+        logger.notice("Restoring an iTerm2 background color left tinted by a previous run.")
+        await restoreITermBackgroundColor(
+            (
+                sessionID: stored.sessionID,
+                previousBackgroundColor: ITermColor(red: stored.red, green: stored.green, blue: stored.blue)
+            ))
     }
 
     // MARK: - Hotkey toggle
@@ -191,7 +207,7 @@ final class PinnedDestinationManager: ObservableObject {
 
     private func setPin(_ target: PinnedTarget) {
         pinned = target
-        persistPin(target)
+
         NotificationManager.shared.showNotification(
             title: String(format: String(localized: "Pinned to %@"), target.displayLabel),
             type: .success
@@ -204,7 +220,7 @@ final class PinnedDestinationManager: ObservableObject {
         clearActiveITermMarkingIfNeeded()
         guard let target = pinned else { return }
         pinned = nil
-        persistPin(nil)
+
         guard notify else { return }
         NotificationManager.shared.showNotification(
             title: String(format: String(localized: "Unpinned %@"), target.displayLabel),
@@ -419,7 +435,7 @@ final class PinnedDestinationManager: ObservableObject {
         case .iTermSession(let id, _, _):
             switch await iTermSessionLiveness(id: id) {
             case .success(let status) where status == "alive":
-                return await finishDelivery(to: target, text: text)
+                return await finishDelivery(to: target, rawText: text)
             case .success:
                 reportGone(target)
                 return false
@@ -444,7 +460,7 @@ final class PinnedDestinationManager: ObservableObject {
                 reResolvedElementPresent: reResolved != nil
             ) {
             case .useCachedElement:
-                return await finishDelivery(to: target, text: text)
+                return await finishDelivery(to: target, rawText: text)
 
             case .useReResolvedElement:
                 guard let reResolved else { return false }
@@ -452,7 +468,7 @@ final class PinnedDestinationManager: ObservableObject {
                     element: reResolved, appName: appName, bundleID: bundleID, pid: pid, windowTitle: windowTitle)
                 // Cache the freshly resolved element so the next delivery can use the fast path again.
                 pinned = reResolvedTarget
-                return await finishDelivery(to: reResolvedTarget, text: text)
+                return await finishDelivery(to: reResolvedTarget, rawText: text)
 
             case .reportGone:
                 reportGone(target)
@@ -481,13 +497,18 @@ final class PinnedDestinationManager: ObservableObject {
                 reportGone(target)
                 return false
             }
-            return await finishDelivery(to: target, text: text)
+            return await finishDelivery(to: target, rawText: text)
         }
     }
 
-    private func finishDelivery(to target: PinnedTarget, text: String) async -> Bool {
+    private func finishDelivery(to target: PinnedTarget, rawText: String) async -> Bool {
         let rules = PinnedDestinationEnterRulesManager.shared
         let appendReturn = rules.appendReturn(forBundleIdentifier: target.bundleIdentifier)
+        let text = PinnedDestinationEnterRuleStore.deliveredText(
+            rawText,
+            appendReturn: appendReturn,
+            appendSpace: rules.appendSpace(forBundleIdentifier: target.bundleIdentifier)
+        )
         // Never logs the dictated text itself - only routing metadata. This line exists
         // because "text arrived but Return did not" is invisible from the outside: every
         // step can succeed while appendReturn quietly resolves to false, and only this
@@ -560,7 +581,7 @@ final class PinnedDestinationManager: ObservableObject {
     private func reportGone(_ target: PinnedTarget) {
         clearActiveITermMarkingIfNeeded()
         pinned = nil
-        persistPin(nil)
+
         NotificationManager.shared.showNotification(
             title: String(
                 format: String(localized: "Pinned destination (%@) is gone. Text was not delivered."),
@@ -592,7 +613,7 @@ final class PinnedDestinationManager: ObservableObject {
     private func reportDeliveryFailed(_ target: PinnedTarget) {
         clearActiveITermMarkingIfNeeded()
         pinned = nil
-        persistPin(nil)
+
         NotificationManager.shared.showNotification(
             title: String(
                 format: String(localized: "Could not deliver to pinned destination (%@). Text was not delivered."),
@@ -727,6 +748,22 @@ final class PinnedDestinationManager: ObservableObject {
     // two separate `write text` calls are not read by the destination as one burst.
     private static let insertModeSettleDelaySeconds: Double = 0.1
 
+    /// The insert-mode prefix: the letter `i`, immediately followed by a DEL (0x7F, what the
+    /// Delete/Backspace key sends). This pair is self-cancelling in BOTH starting states, which
+    /// is the whole point - VoiceInk cannot ask a modal TUI which mode it is currently in:
+    ///
+    /// - Starting in NORMAL mode, `i` switches to insert mode and is consumed as a command, so
+    ///   nothing is typed; the DEL then deletes from an empty position and does nothing.
+    /// - Starting in INSERT mode already, `i` is typed as a literal character; the DEL then
+    ///   deletes exactly that character.
+    ///
+    /// Either way the destination ends up in insert mode with an unchanged buffer. Sending the
+    /// bare `i` alone - which this used to do - left a stray literal `i` in front of every
+    /// dictation whenever the target was already in insert mode. `character id 127` produces
+    /// the DEL byte from AppleScript without embedding a raw control character in the script
+    /// source.
+    private static let insertModePrefixStatement = "write text (\"i\" & (character id 127)) newline no"
+
     /// One step of an iTerm2 delivery sequence. Kept as data - not executed inline - so
     /// the ORDER and ROLE of each write is unit-testable without any live AppleScript
     /// or iTerm2 state; see `iTermDeliverySteps` and `decideITermDeliveryOutcome` below.
@@ -760,7 +797,7 @@ final class PinnedDestinationManager: ObservableObject {
         if sendInsertPrefix {
             steps.append(
                 ITermDeliveryStep(
-                    statement: "write text \"i\" newline no",
+                    statement: insertModePrefixStatement,
                     role: .insertModePrefix,
                     settleDelaySeconds: insertModeSettleDelaySeconds
                 ))
@@ -937,122 +974,108 @@ final class PinnedDestinationManager: ObservableObject {
         return result
     }
 
-    // MARK: - iTerm2 session marking (badge)
+    // MARK: - iTerm2 session marking (background tint)
 
     // With many panes open, the notification and menu-bar-icon backdrop tell the user THAT
-    // something is pinned, but not WHICH pane - they still have to hunt for it. This marks the
-    // pinned session itself so it is identifiable at a glance, entirely opt-in (see
-    // `PinnedDestinationSettingsKeys.markPinnedITermSessionWithBadge`) and always reverted:
-    // on explicit unpin, on re-pinning to a different target, and (best-effort) when the pin
+    // something is pinned, but not WHICH pane - they still have to hunt for it. This tints the
+    // pinned session's background so it is identifiable at a glance, entirely opt-in (see
+    // `PinnedDestinationSettingsKeys.highlightPinnedITermSession`) and always reverted: on
+    // explicit unpin, on re-pinning to a different target, and (best-effort) when the pin
     // self-clears because the session died.
     //
-    // MECHANISM: iTerm2's badge is an interpolated string configured once in
-    // Settings > Profiles > General > Badge (e.g. `\(user.voiceink_pinned)`) - see
-    // https://iterm2.com/documentation-badges.html. Classic AppleScript has no command to set
-    // that FORMAT directly (only the proprietary `OSC 1337 ; SetBadgeFormat=...` escape
-    // sequence can, and that must be emitted as terminal OUTPUT by whatever is running inside
-    // the session - `write text` instead feeds the pty as INPUT, i.e. keystrokes to the running
-    // program, which is not just unreliable here but actively unsafe: raw escape bytes typed
-    // into a live shell prompt or a modal TUI could be interpreted as a command). What
-    // AppleScript CAN do, and is what this uses, is set a user-defined session VARIABLE
-    // (`set variable named "user.<name>" to "<value>"` - confirmed in iTerm2's own Sessions
-    // scripting reference), which is exactly the mechanism badges are built on. This makes the
-    // badge visible ONLY if the user's iTerm2 profile is already configured to display that
-    // variable; the settings footer explains this so the toggle is not silently a no-op.
+    // MECHANISM: a session's `background color` is directly readable and writable over
+    // AppleScript as an RGB triple of 16-bit components. Verified against a live session -
+    // reading returns the current value, writing takes effect immediately, and writing the
+    // captured value back restores the original exactly.
     //
-    // WHY A BADGE OVER THE ALTERNATIVES: a badge is an unmistakable overlay that never touches
-    // the user's actual color scheme (unlike changing background color, which was rejected -
-    // if VoiceInk crashed while pinned, a wrong-colored pane looks like a bug with no visible
-    // explanation, whereas a leftover "VoiceInk Pinned" badge, even if never cleared, is
-    // self-evidently informative about what happened and why). Setting the session/tab NAME
-    // instead was also considered: simpler and just as reliable via AppleScript, but it
-    // overwrites a title many terminal-heavy users (exactly this feature's audience) rely on
-    // for their own purposes, and a small title-bar change is easy to miss with many tabs open
-    // - the badge is drawn large and translucent directly over the pane content instead.
+    // WHY A TINT RATHER THAN A BADGE: a badge was implemented first and removed. iTerm2's
+    // badge TEXT cannot be set over AppleScript at all - only a user-defined variable can be,
+    // and the badge then shows that variable ONLY if the user has already put it in their
+    // profile's Badge Text field. For anyone who has not, the toggle is silently a no-op, which
+    // is exactly how it behaved in practice. A background tint needs no profile setup and is
+    // impossible to miss.
     //
-    // CANNOT BE VERIFIED WITHOUT A LIVE iTerm2: this app must not launch or drive iTerm2 to
-    // develop this feature, so the exact AppleScript form for READING a variable's current
-    // value (`readITermSessionVariable` below) - as opposed to setting one, which mirrors the
-    // already-proven `writeToITermSession` pattern exactly - has not been exercised against a
-    // real session. It is written in the most conservative, unambiguous form available (a full
-    // `tell s ... end tell` block rather than relying on an untested "of"-tail or a `return`
-    // nested inside that block) specifically to minimize that risk; it should be verified
-    // against a live iTerm2 session before this ships.
+    // THE RISK THIS ACCEPTS: unlike a badge, this touches the user's actual color scheme, so a
+    // tint left behind (VoiceInk killed mid-pin, say) looks like the terminal broke rather than
+    // like a leftover marker. Two things bound that: the original color is captured BEFORE the
+    // tint is applied and restored verbatim on every path that ends a pin, and the tint is never
+    // applied at all unless that capture succeeded - see `markITermSessionPinned`. Restoring a
+    // color VoiceInk never read would be a worse outcome than not tinting in the first place.
 
-    /// User-defined session variable VoiceInk writes to for the pinned-session badge marker.
-    /// Scoped under "user." because that is the only namespace `set variable named` is allowed
-    /// to write to (iTerm2 rejects writes to its own built-in variables), and prefixed with this
-    /// app's name so it can never collide with the user's own shell integration, dotfiles, or
-    /// another tool's badge variable.
-    private static let iTermBadgeVariableName = "user.voiceink_pinned"
+    /// Background color applied to a pinned session, as iTerm2's 16-bit RGB components. A deep,
+    /// desaturated green - the same signal as the menu bar icon's green backdrop, not an
+    /// unrelated color. Kept DARK rather than pale on purpose: this sits behind the user's real
+    /// terminal content for as long as the pin lasts, and terminal schemes are overwhelmingly
+    /// light text on a dark background, so a pale tint inverts the contrast the scheme was built
+    /// around and makes the pane hard to read. Dark enough to leave light foreground text
+    /// legible, green enough to be unmistakable next to an untinted pane.
+    private static let iTermPinnedBackgroundColor = ITermColor(red: 1500, green: 9000, blue: 4500)
 
-    /// Fixed marker text written into the badge variable while a session is pinned. Not derived
-    /// from the session name or anything else the badge already shows elsewhere - the badge's
-    /// entire purpose here is answering "is THIS the pinned one?", which a constant string
-    /// answers unambiguously without any per-session computation.
-    private static let iTermBadgeMarkerText = "VoiceInk Pinned"
+    /// The currently-tinted session, if any: its id, and the background color it had immediately
+    /// before VoiceInk overwrote it, so unmarking can put back exactly what was there. Kept
+    /// separate from `pinned` itself (rather than folded into `PinnedTarget.iTermSession`) so
+    /// this purely cosmetic, best-effort side channel cannot affect the target's
+    /// identity/equality or ripple into every existing call site that pattern-matches that case.
+    private var activeITermMarking: (sessionID: String, previousBackgroundColor: ITermColor)?
 
-    /// The currently-marked session, if any: its id, and whatever value its badge variable held
-    /// immediately before VoiceInk overwrote it, so unmarking can put back exactly what was
-    /// there. `previousBadgeValue` is `nil` when that capture itself failed (permission denied,
-    /// or an unclassified AppleScript failure) rather than when the variable was simply unset -
-    /// an unset user-defined variable reads back as an empty string, which IS a known value and
-    /// restores the same way any other captured value does; `nil` specifically means "unknown,
-    /// so fall back to clearing rather than risk restoring something that was never actually
-    /// there" - see `decideITermBadgeRestoreAction`. Kept separate from `pinned` itself (rather
-    /// than folded into `PinnedTarget.iTermSession`) so this purely cosmetic, best-effort side
-    /// channel cannot affect the target's identity/equality or ripple into every existing call
-    /// site that pattern-matches that case.
-    private var activeITermMarking: (sessionID: String, previousBadgeValue: String?)?
-
-    /// What to do with a previously captured badge-variable value when a marking is cleared.
-    /// Pure decision table: a known previous value (including a known-empty one) is restored
-    /// verbatim; an unknown one (capture failed) falls back to clearing the marker to empty
-    /// rather than risking a wrong restore. `nonisolated` so this pure lookup is unit-testable
-    /// synchronously, same as the other decision tables in this file.
-    enum ITermBadgeRestoreAction: Equatable {
-        case restore(String)
-        case clearToEmpty
+    /// An iTerm2 color as the three 16-bit components its scripting interface uses.
+    struct ITermColor: Equatable {
+        let red: Int
+        let green: Int
+        let blue: Int
     }
 
-    nonisolated static func decideITermBadgeRestoreAction(previousValue: String?) -> ITermBadgeRestoreAction {
-        if let previousValue { return .restore(previousValue) }
-        return .clearToEmpty
+    /// Parses the `r,g,b` string produced by `readITermSessionBackgroundColor`'s script. The
+    /// components are formatted and re-joined explicitly by that script rather than relying on
+    /// AppleScript's own list coercion, which renders `{0, 0, 0}` as the unparseable "000".
+    /// `nonisolated static` so this pure parser is unit-testable synchronously, same as the
+    /// other parsers in this file.
+    nonisolated static func parseITermColor(_ raw: String?) -> ITermColor? {
+        guard let raw else { return nil }
+        let parts = raw.split(separator: ",")
+        guard parts.count == 3,
+            let red = Int(parts[0].trimmingCharacters(in: .whitespaces)),
+            let green = Int(parts[1].trimmingCharacters(in: .whitespaces)),
+            let blue = Int(parts[2].trimmingCharacters(in: .whitespaces))
+        else {
+            return nil
+        }
+        return ITermColor(red: red, green: green, blue: blue)
     }
 
-    /// Best-effort: marks `id`'s badge variable, first capturing whatever value it already had
-    /// so `clearActiveITermMarkingIfNeeded` can put it back exactly. Never awaited by its
-    /// caller (see the `Task { ... }` in `toggle()`) - marking is a nicety, never a
-    /// precondition for the pin itself, which has already succeeded by the time this runs.
-    /// Every failure here is logged and swallowed, never surfaced as a pinning failure.
+    nonisolated static func setBackgroundColorStatement(_ color: ITermColor) -> String {
+        "set background color to {\(color.red), \(color.green), \(color.blue)}"
+    }
+
+    /// Best-effort: tints `id`'s background, first capturing the color it already had so
+    /// `clearActiveITermMarkingIfNeeded` can put it back exactly. Never awaited by its caller
+    /// (see the `Task { ... }` in `toggle()`) - marking is a nicety, never a precondition for
+    /// the pin itself, which has already succeeded by the time this runs. Every failure here is
+    /// logged and swallowed, never surfaced as a pinning failure.
     private func markITermSessionPinned(id: String) async {
-        guard UserDefaults.standard.bool(forKey: PinnedDestinationSettingsKeys.markPinnedITermSessionWithBadge)
+        guard UserDefaults.standard.bool(forKey: PinnedDestinationSettingsKeys.highlightPinnedITermSession)
         else {
             return
         }
 
-        let previousValue: String?
-        switch await readITermSessionVariable(id: id, name: Self.iTermBadgeVariableName) {
-        case .success(let value):
-            previousValue = value ?? ""
-        case .permissionDenied:
-            // Reading and writing are gated by the same Automation permission - if the read
-            // was refused, the write would be too, so there is no point attempting it.
-            logger.notice("Skipping pinned iTerm2 session badge: Automation permission not granted.")
+        // No capture, no tint. Applying a color VoiceInk cannot undo would leave the user's
+        // terminal permanently recolored with no way back short of reopening the pane.
+        guard let previousColor = Self.parseITermColor(await readITermSessionBackgroundColor(id: id)) else {
+            logger.notice("Skipping pinned iTerm2 session tint: could not read the session's current background color.")
             return
-        case .failed:
-            previousValue = nil
         }
 
-        activeITermMarking = (sessionID: id, previousBadgeValue: previousValue)
+        activeITermMarking = (sessionID: id, previousBackgroundColor: previousColor)
 
-        let statement =
-            "set variable named \"\(Self.iTermBadgeVariableName)\" to \(Self.appleScriptTextLiteral(for: Self.iTermBadgeMarkerText))"
+        let statement = Self.setBackgroundColorStatement(Self.iTermPinnedBackgroundColor)
         switch Self.classifyITermWriteOutcome(await writeToITermSession(id: id, statement: statement)) {
         case .ok:
-            break
+            // Recorded only after the tint actually landed, so a failed write never leaves
+            // a restore pending for a color that was never changed.
+            persistActiveMarking(activeITermMarking)
+            logger.notice("Tinted pinned iTerm2 session.")
         case .gone, .permissionDenied, .failed:
-            logger.notice("Could not mark pinned iTerm2 session with a badge; continuing without it.")
+            logger.notice("Could not tint pinned iTerm2 session; continuing without it.")
             // Nothing was actually written, so there is nothing to restore later.
             activeITermMarking = nil
         }
@@ -1066,58 +1089,46 @@ final class PinnedDestinationManager: ObservableObject {
     /// the restore even starts - is what guarantees a restore is attempted AT MOST once no
     /// matter how many of those paths run or how they interleave, and is also why this never
     /// awaits its own restore: unpinning must complete immediately regardless of how long the
-    /// AppleScript round-trip to iTerm2 takes, since restoring a badge is a nicety and must
+    /// AppleScript round-trip to iTerm2 takes, since restoring a color is a nicety and must
     /// never add latency to the operation the user actually asked for.
     private func clearActiveITermMarkingIfNeeded() {
         guard let marking = activeITermMarking else { return }
         activeITermMarking = nil
+        persistActiveMarking(nil)
 
         Task { [weak self] in
-            await self?.restoreITermBadge(marking)
+            await self?.restoreITermBackgroundColor(marking)
         }
     }
 
-    private func restoreITermBadge(_ marking: (sessionID: String, previousBadgeValue: String?)) async {
-        let restoreValue: String
-        switch Self.decideITermBadgeRestoreAction(previousValue: marking.previousBadgeValue) {
-        case .restore(let value):
-            restoreValue = value
-        case .clearToEmpty:
-            restoreValue = ""
-        }
-
-        let statement =
-            "set variable named \"\(Self.iTermBadgeVariableName)\" to \(Self.appleScriptTextLiteral(for: restoreValue))"
+    private func restoreITermBackgroundColor(_ marking: (sessionID: String, previousBackgroundColor: ITermColor)) async
+    {
+        let statement = Self.setBackgroundColorStatement(marking.previousBackgroundColor)
         // Best-effort only: if the session already died (the exact case `reportGone` calls this
-        // from), this write itself reports "gone" from the enumeration loop below - that is
-        // expected, not an error, and there is nothing further to do about it. Never throws,
-        // never retried, never surfaced to the user - see the doc comment above.
+        // from), this write itself reports "gone" from the enumeration loop - that is expected,
+        // not an error, and there is nothing further to do about it. Never throws, never
+        // retried, never surfaced to the user - see the doc comment above.
         _ = await writeToITermSession(id: marking.sessionID, statement: statement)
     }
 
-    /// Reads the current value of a user-defined variable from the iTerm2 session identified by
-    /// `id`, using the same enumerate-and-compare pattern as every other iTerm2 lookup in this
-    /// file (no top-level `session id "..."` specifier exists - see the note on
-    /// `iTermSessionLiveness`). An unset user-defined variable reads back as an empty string,
-    /// not an error - iTerm2 does not distinguish "never set" from "set to empty" at the
-    /// scripting layer, and neither does this. See the section-level comment above for why the
-    /// exact AppleScript form here (a full `tell s ... end tell` block, with `return` placed
-    /// AFTER that block rather than inside it) was chosen deliberately conservatively and could
-    /// not be verified against a live session.
-    private func readITermSessionVariable(id: String, name: String) async -> AppleScriptOutcome {
+    /// Reads the background color of the session identified by `id` as an `r,g,b` string, using
+    /// the same enumerate-and-compare pattern as every other iTerm2 lookup in this file (no
+    /// top-level `session id "..."` specifier exists - see the note on `iTermSessionLiveness`).
+    /// The components are formatted individually and joined with commas rather than returning
+    /// the color list itself: AppleScript coerces `{0, 0, 0}` to the string "000", which cannot
+    /// be split back into components. Returns nil if the session was not found or the read
+    /// failed, which the caller treats as "do not tint at all".
+    private func readITermSessionBackgroundColor(id: String) async -> String? {
         let script = """
             tell application "iTerm2"
                 repeat with w in windows
                     repeat with t in tabs of w
                         repeat with s in sessions of t
                             if (id of s) is "\(Self.escapedForAppleScript(id))" then
-                                set v to ""
-                                try
-                                    tell s
-                                        set v to variable "\(Self.escapedForAppleScript(name))"
-                                    end tell
-                                end try
-                                return v
+                                tell s
+                                    set c to background color
+                                end tell
+                                return ((item 1 of c) as text) & "," & ((item 2 of c) as text) & "," & ((item 3 of c) as text)
                             end if
                         end repeat
                     end repeat
@@ -1125,7 +1136,8 @@ final class PinnedDestinationManager: ObservableObject {
                 return ""
             end tell
             """
-        return await runAppleScript(script)
+        guard case .success(let value) = await runAppleScript(script) else { return nil }
+        return value
     }
 
     // MARK: - AX delivery

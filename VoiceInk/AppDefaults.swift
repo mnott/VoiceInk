@@ -13,17 +13,43 @@ enum RecorderDisplaySettingsKeys {
 }
 
 enum PinnedDestinationSettingsKeys {
-    /// Whether a pinned iTerm2 session gets its badge variable marked while pinned - see
+    /// Whether a pinned iTerm2 session gets its background tinted while pinned - see
     /// `PinnedDestinationManager`'s "iTerm2 session marking" section for the full mechanism.
-    /// Defaults to off (see `AppDefaults.registerDefaults` below): this writes to the user's
-    /// terminal session via AppleScript, and even though it is invisible unless their iTerm2
-    /// profile's Badge Text already references it, an app should not start touching terminal
-    /// session state the user never asked for without an explicit opt-in.
-    static let markPinnedITermSessionWithBadge = "MarkPinnedITermSessionWithBadge"
+    /// Defaults to off (see `AppDefaults.registerDefaults` below): this changes the user's
+    /// terminal color scheme for as long as the pin lasts, which an app should never start
+    /// doing without an explicit opt-in.
+    static let highlightPinnedITermSession = "HighlightPinnedITermSession"
 }
 
 enum AppDefaults {
+    /// Key the pinned-session marker used before it tinted the background: it set an iTerm2
+    /// badge variable instead, which only ever showed anything if the user had already wired
+    /// that variable into their profile's Badge Text. Kept solely to carry a prior opt-in
+    /// across - see `migratePinnedITermMarkerPreference`.
+    private static let legacyPinnedITermBadgeKey = "MarkPinnedITermSessionWithBadge"
+
+    /// Carries a user who had already opted into marking the pinned session over to the key
+    /// that replaced it. Without this the toggle silently reverts to off on upgrade, and the
+    /// feature reads as broken rather than as switched off - which is exactly how it was
+    /// reported. Runs once: it only writes when the new key has no value of its own.
+    private static func migratePinnedITermMarkerPreference() {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: PinnedDestinationSettingsKeys.highlightPinnedITermSession) == nil,
+            defaults.object(forKey: legacyPinnedITermBadgeKey) != nil
+        else {
+            return
+        }
+
+        defaults.set(
+            defaults.bool(forKey: legacyPinnedITermBadgeKey),
+            forKey: PinnedDestinationSettingsKeys.highlightPinnedITermSession
+        )
+        defaults.removeObject(forKey: legacyPinnedITermBadgeKey)
+    }
+
     static func registerDefaults() {
+        migratePinnedITermMarkerPreference()
+
         UserDefaults.standard.register(defaults: [
             // Onboarding & General
             "hasCompletedOnboardingV2": false,
@@ -60,7 +86,7 @@ enum AppDefaults {
             CleanupSettingsKeys.audioRetentionPeriod: 7,
 
             // Pinned Destination
-            PinnedDestinationSettingsKeys.markPinnedITermSessionWithBadge: false,
+            PinnedDestinationSettingsKeys.highlightPinnedITermSession: false,
 
             // UI & Behavior
             "IsMenuBarOnly": false,
