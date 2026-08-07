@@ -92,7 +92,12 @@ struct PinnedDestinationSettingsSection: View {
                                 Toggle(
                                     "Append Space",
                                     isOn: Binding(
-                                        get: { rule.appendSpace },
+                                        // Shows what will actually happen, not what is stored: with
+                                        // Submit With Return on, no space is appended, so a switch
+                                        // left visibly on would contradict the behaviour beside it.
+                                        // The stored preference is untouched and reappears as soon
+                                        // as submission is turned back off.
+                                        get: { !rule.appendReturn && rule.appendSpace },
                                         set: {
                                             rulesManager.setRule(
                                                 bundleIdentifier: rule.bundleIdentifier,

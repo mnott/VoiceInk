@@ -416,6 +416,126 @@ struct PinnedDestinationEnterRuleBackwardCompatibilityTests {
     }
 }
 
+// MARK: - Normal (unpinned) delivery: per-app rule precedence
+
+struct NormalDeliveryPrecedenceTests {
+    @Test func ruleWithAppendReturnSubmitsAndAddsNoSpace() {
+        // The operator's original complaint in reverse: an explicit rule that wants Return
+        // must actually submit, even though the app-wide preferences below are never
+        // consulted once a rule exists.
+        let rule = PinnedDestinationEnterRule(
+            bundleIdentifier: "com.apple.Terminal", appName: "Terminal", appendReturn: true)
+        let decision = PinnedDestinationEnterRuleStore.deliveryDecision(
+            forRule: rule,
+            modeAutoSendKeyIsNone: true,
+            globalAutoEnterAfterTranscription: false,
+            globalAppendTrailingSpace: false
+        )
+        #expect(decision.submit == true)
+        #expect(decision.appendSpace == false)
+    }
+
+    @Test func ruleWithAppendReturnFalseAndAppendSpaceTrueContinuesRatherThanSubmitting() {
+        // This is the exact regression: a per-app rule configured for "insert and add a
+        // space" must not submit just because the global "Auto Enter after transcription"
+        // preference happens to be on - the rule is the most specific scope and wins.
+        let rule = PinnedDestinationEnterRule(
+            bundleIdentifier: "com.apple.TextEdit", appName: "TextEdit", appendReturn: false,
+            appendSpace: true)
+        let decision = PinnedDestinationEnterRuleStore.deliveryDecision(
+            forRule: rule,
+            modeAutoSendKeyIsNone: true,
+            globalAutoEnterAfterTranscription: true,
+            globalAppendTrailingSpace: false
+        )
+        #expect(decision.submit == false)
+        #expect(decision.appendSpace == true)
+    }
+
+    @Test func noRuleWithGlobalAutoEnterOnSubmits() {
+        // With nothing configured for this app, behavior must stay exactly as it was
+        // before per-app rules reached this path: the global toggle alone decides.
+        let decision = PinnedDestinationEnterRuleStore.deliveryDecision(
+            forRule: nil,
+            modeAutoSendKeyIsNone: true,
+            globalAutoEnterAfterTranscription: true,
+            globalAppendTrailingSpace: false
+        )
+        #expect(decision.submit == true)
+    }
+
+    @Test func noRuleWithGlobalAutoEnterOffAndAppendSpaceOnAddsSpaceWithoutSubmitting() {
+        let decision = PinnedDestinationEnterRuleStore.deliveryDecision(
+            forRule: nil,
+            modeAutoSendKeyIsNone: true,
+            globalAutoEnterAfterTranscription: false,
+            globalAppendTrailingSpace: true
+        )
+        #expect(decision.submit == false)
+        #expect(decision.appendSpace == true)
+    }
+
+    @Test func noRuleWithAModeAutoSendKeyAlreadyChosenSubmitsRegardlessOfTheGlobalToggle() {
+        // The mode's own choice is itself an app-wide (not per-app) preference, so with no
+        // rule present it still wins over the global fallback exactly as before.
+        let decision = PinnedDestinationEnterRuleStore.deliveryDecision(
+            forRule: nil,
+            modeAutoSendKeyIsNone: false,
+            globalAutoEnterAfterTranscription: false,
+            globalAppendTrailingSpace: false
+        )
+        #expect(decision.submit == true)
+    }
+
+    @Test func ruleSendInsertPrefixIsCarriedThroughRegardlessOfAppendReturn() {
+        for appendReturn in [false, true] {
+            let rule = PinnedDestinationEnterRule(
+                bundleIdentifier: "com.googlecode.iterm2", appName: "iTerm2", appendReturn: appendReturn,
+                sendInsertPrefix: true)
+            let decision = PinnedDestinationEnterRuleStore.deliveryDecision(
+                forRule: rule,
+                modeAutoSendKeyIsNone: true,
+                globalAutoEnterAfterTranscription: false,
+                globalAppendTrailingSpace: false
+            )
+            #expect(decision.sendInsertPrefix == true)
+        }
+    }
+
+    @Test func noRuleNeverSendsAnInsertPrefix() {
+        // There is no per-app list entry to source this flag from once no rule applies -
+        // an insert-mode prefix is meaningless without a specific app to reason about.
+        let decision = PinnedDestinationEnterRuleStore.deliveryDecision(
+            forRule: nil,
+            modeAutoSendKeyIsNone: true,
+            globalAutoEnterAfterTranscription: true,
+            globalAppendTrailingSpace: true
+        )
+        #expect(decision.sendInsertPrefix == false)
+    }
+}
+
+// MARK: - Normal (unpinned) delivery: per-app rule lookup
+
+struct NormalDeliveryRuleLookupTests {
+    @Test func lookupReturnsTheMatchingRule() {
+        let rule = PinnedDestinationEnterRule(
+            bundleIdentifier: "com.apple.TextEdit", appName: "TextEdit", appendReturn: true)
+        let found = PinnedDestinationEnterRuleStore.rule(
+            forBundleIdentifier: "com.apple.TextEdit", rules: [rule])
+        #expect(found == rule)
+    }
+
+    @Test func lookupReturnsNilRatherThanAFabricatedDefaultWhenNoRuleExists() {
+        // Distinct from `appendReturn`/`sendInsertPrefix`/`appendSpace`, which each return a
+        // default value with no rule present - this lookup must expose the absence itself so
+        // `deliveryDecision` can tell "no rule" apart from "a rule with every flag off".
+        let found = PinnedDestinationEnterRuleStore.rule(
+            forBundleIdentifier: "com.apple.TextEdit", rules: [])
+        #expect(found == nil)
+    }
+}
+
 // MARK: - Pinned Destination: iTerm2 delivery step sequencing
 
 struct PinnedDestinationITermDeliveryStepsTests {

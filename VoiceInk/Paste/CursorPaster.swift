@@ -243,4 +243,57 @@ class CursorPaster {
         enterDown?.post(tap: .cghidEventTap)
         enterUp?.post(tap: .cghidEventTap)
     }
+
+    // MARK: - Insert-mode prefix (normal delivery)
+
+    /// Sends "i" immediately followed by DEL to whatever is frontmost, posted via
+    /// `.cghidEventTap` and gated on `AXIsProcessTrusted()` exactly like `performAutoSend` above -
+    /// unlike `PinnedDestinationManager`'s pid-targeted equivalent, normal (unpinned) delivery has
+    /// no captured target process to post to, only "whatever is frontmost right now", which is
+    /// exactly what the event tap already delivers to.
+    ///
+    /// The pair is deliberately self-cancelling without needing to know the target's mode: from a
+    /// modal TUI's normal mode (an interactive coding agent in a terminal, for example), "i"
+    /// switches it into insert mode and is consumed as a command rather than typed, so the DEL
+    /// that follows deletes nothing; from an already-active insert/typing mode, "i" is entered
+    /// literally as text and the DEL immediately removes it. Either way the target is left exactly
+    /// as if this pair had never been sent, and ready to receive the dictated text that follows -
+    /// see the comment on `PinnedDestinationManager.insertModePrefixStatement` for the equivalent
+    /// iTerm2-specific mechanism this mirrors.
+    static func performInsertModePrefix() {
+        guard AXIsProcessTrusted() else { return }
+
+        let source = CGEventSource(stateID: .privateState)
+
+        // "i" is posted as a Unicode string rather than mapped to a virtual key code, the same
+        // technique `PinnedDestinationManager.postUnicodeString` uses: a virtual key code is a
+        // physical key position, which is only "i" on a QWERTY layout, while a Unicode string
+        // event types the character itself regardless of the active layout. `kVK_ANSI_A` is the
+        // key code carried on the event only as a placeholder - the receiving app reads the
+        // overridden unicode string, not the code - chosen (rather than 0) only so it never
+        // coincides with a code some app treats specially.
+        guard let iDown = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_A), keyDown: true),
+            let iUp = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_A), keyDown: false)
+        else {
+            logger.error("Failed to create insert-mode prefix 'i' keyboard events")
+            return
+        }
+        let iCharacter: [UniChar] = Array("i".utf16)
+        iDown.keyboardSetUnicodeString(stringLength: iCharacter.count, unicodeString: iCharacter)
+        iUp.keyboardSetUnicodeString(stringLength: iCharacter.count, unicodeString: iCharacter)
+
+        // DEL (kVK_Delete) is a physical key position, not a character, so there is nothing
+        // layout-dependent to translate - a virtual key code is exactly right here, unlike "i".
+        guard let delDown = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_Delete), keyDown: true),
+            let delUp = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_Delete), keyDown: false)
+        else {
+            logger.error("Failed to create insert-mode prefix DEL keyboard events")
+            return
+        }
+
+        iDown.post(tap: .cghidEventTap)
+        iUp.post(tap: .cghidEventTap)
+        delDown.post(tap: .cghidEventTap)
+        delUp.post(tap: .cghidEventTap)
+    }
 }

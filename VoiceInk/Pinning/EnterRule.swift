@@ -130,6 +130,56 @@ enum PinnedDestinationEnterRuleStore {
         return text + " "
     }
 
+    /// Looks up the whole rule for a bundle id rather than resolving one flag at a time like
+    /// `appendReturn`/`sendInsertPrefix`/`appendSpace` above. Those three collapse "no rule
+    /// exists" and "a rule exists but this particular flag is off" into the same `false`, which
+    /// is fine for the pinned-delivery path where a rule always applies - but normal (unpinned)
+    /// delivery needs to tell the two apart: an explicit per-app rule must override the app-wide
+    /// preferences even when every one of its own flags is false, since that is a deliberate
+    /// "do nothing for this app" choice, not the absence of one.
+    static func rule(
+        forBundleIdentifier bundleIdentifier: String,
+        rules: [PinnedDestinationEnterRule]
+    ) -> PinnedDestinationEnterRule? {
+        rules.first(where: { $0.bundleIdentifier == bundleIdentifier })
+    }
+
+    /// The three delivery choices normal (unpinned) delivery has to make, once precedence
+    /// between a per-app rule and the app-wide preferences has been resolved.
+    struct DeliveryDecision: Equatable {
+        let submit: Bool
+        let appendSpace: Bool
+        let sendInsertPrefix: Bool
+    }
+
+    /// Resolves what normal (unpinned) delivery should do for the frontmost app: an explicit
+    /// per-app rule is the most specific scope available and wins outright, regardless of the
+    /// mode's own auto-send key or either global preference - the same precedence the pinned
+    /// path already gives it via `appendReturn`/`sendInsertPrefix`/`appendSpace` above. Only when
+    /// no rule exists at all do the app-wide preferences apply, and they apply exactly as they
+    /// did before per-app rules reached this path: the mode's own auto-send key wins if it set
+    /// one, otherwise the global "Auto Enter after transcription" toggle decides submission, and
+    /// the global "Append Trailing Space" toggle is added unconditionally (not gated on
+    /// submission - that already-existing behavior is preserved rather than changed here).
+    /// `nonisolated static` so this precedence table is unit-testable without UserDefaults, a
+    /// live rules manager, or a frontmost app.
+    nonisolated static func deliveryDecision(
+        forRule rule: PinnedDestinationEnterRule?,
+        modeAutoSendKeyIsNone: Bool,
+        globalAutoEnterAfterTranscription: Bool,
+        globalAppendTrailingSpace: Bool
+    ) -> DeliveryDecision {
+        guard let rule else {
+            let submit = modeAutoSendKeyIsNone ? globalAutoEnterAfterTranscription : true
+            return DeliveryDecision(submit: submit, appendSpace: globalAppendTrailingSpace, sendInsertPrefix: false)
+        }
+        return DeliveryDecision(
+            submit: rule.appendReturn,
+            appendSpace: !rule.appendReturn && rule.appendSpace,
+            sendInsertPrefix: rule.sendInsertPrefix
+        )
+    }
+
     static func decode(_ data: Data) -> [PinnedDestinationEnterRule] {
         (try? JSONDecoder().decode([PinnedDestinationEnterRule].self, from: data)) ?? []
     }

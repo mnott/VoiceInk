@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import os
 
@@ -118,18 +119,45 @@ final class TranscriptionDelivery {
             return
         }
 
-        let commandText = deliverableText(from: text)
+        // Captured before the panel is dismissed or the command runs - frontmost can change
+        // during either, and the per-app rule must reflect whichever app the user was actually
+        // looking at when dictation finished. See `PinnedDestinationEnterRuleStore.deliveryDecision`
+        // for why an explicit rule here overrides the app-wide preferences below outright.
+        let rule = frontmostRule()
+        let decision = PinnedDestinationEnterRuleStore.deliveryDecision(
+            forRule: rule,
+            modeAutoSendKeyIsNone: item.output.autoSendKey == .none,
+            globalAutoEnterAfterTranscription: UserDefaults.standard.bool(forKey: "AutoEnterAfterTranscription"),
+            globalAppendTrailingSpace: false
+        )
+
+        let rawCommandText = deliverableText(from: text)
+        // A custom command delivers text just like a paste does, so it has to honor auto-send
+        // the same way. Without this the global "Auto Enter after transcription" preference
+        // silently applies to paste output ONLY, and any mode routing through a command can
+        // never submit - the text lands and simply sits there. The command's own delivery
+        // mechanism is irrelevant here: whatever it did, the cursor ends up in the app the user
+        // is looking at, which is exactly where the paste path posts its key too.
+        let commandText: String
+        let autoSendKey: AutoSendKey
+        if let rule {
+            commandText = PinnedDestinationEnterRuleStore.deliveredText(
+                rawCommandText, appendReturn: rule.appendReturn, appendSpace: rule.appendSpace)
+            autoSendKey = decision.submit ? .enter : .none
+        } else {
+            commandText = rawCommandText
+            autoSendKey = Self.resolvedAutoSendKey(for: item.output)
+        }
+
         SoundManager.shared.playStopSound()
         await actions.dismiss()
 
-        // A custom command delivers text just like a paste does, so it has to honor
-        // auto-send the same way. Without this the global "Auto Enter after
-        // transcription" preference silently applies to paste output ONLY, and any mode
-        // routing through a command can never submit - the text lands and simply sits
-        // there. The command's own delivery mechanism is irrelevant here: whatever it
-        // did, the cursor ends up in the app the user is looking at, which is exactly
-        // where the paste path posts its key too.
-        let autoSendKey = Self.resolvedAutoSendKey(for: item.output)
+        // `sendInsertPrefix` is only ever true when a rule was resolved, which in turn only
+        // happens when a frontmost bundle id was captured above - see `frontmostRule`.
+        if decision.sendInsertPrefix {
+            CursorPaster.performInsertModePrefix()
+            try? await Task.sleep(nanoseconds: UInt64(Self.insertModeSettleDelaySeconds * 1_000_000_000))
+        }
 
         Task {
             let delivered = await runCustomCommand(command: command, commandText: commandText)
@@ -152,6 +180,23 @@ final class TranscriptionDelivery {
     /// Gap between text landing and the submit key. Long enough for terminal emulators,
     /// which needed more than the original 100ms.
     private static let autoSendDelaySeconds: Double = 0.5
+
+    /// Settle delay between the insert-mode prefix and the text delivery that follows it,
+    /// mirroring `PinnedDestinationManager.insertModeSettleDelaySeconds` - see that constant's
+    /// comment for why this exact figure is a reasoned judgement call rather than a proven one.
+    private static let insertModeSettleDelaySeconds: Double = 0.1
+
+    /// The per-app rule for whatever is frontmost right now. Must be called before dismissing
+    /// the panel or starting delivery - both can change what is frontmost, and the rule has to
+    /// reflect whichever app the user was actually looking at when dictation finished, not
+    /// whatever ends up frontmost afterward.
+    private func frontmostRule() -> PinnedDestinationEnterRule? {
+        guard let bundleIdentifier = NSWorkspace.shared.frontmostApplication?.bundleIdentifier else {
+            return nil
+        }
+        return PinnedDestinationEnterRuleStore.rule(
+            forBundleIdentifier: bundleIdentifier, rules: PinnedDestinationEnterRulesManager.shared.rules)
+    }
 
     @discardableResult
     private func runCustomCommand(command: String, commandText: String) async -> Bool {
@@ -207,20 +252,45 @@ final class TranscriptionDelivery {
 
     private func paste(_ text: String, output: OutputRuntimeConfiguration, actions: Actions) async {
         let textToPaste = deliverableText(from: text)
-        let appendSpace = UserDefaults.standard.bool(forKey: "AppendTrailingSpace")
-        let pastedText = textToPaste + (appendSpace ? " " : "")
+
+        // Captured before the panel is dismissed or the paste starts - see the doc comment on
+        // `frontmostRule`. An explicit per-app rule is the most specific scope available and
+        // wins outright over the mode's own auto-send key and both global preferences below -
+        // see `PinnedDestinationEnterRuleStore.deliveryDecision`.
+        let rule = frontmostRule()
+        let modeAutoSendKey: AutoSendKey = output.outputMode == .paste ? output.autoSendKey : .none
+        let decision = PinnedDestinationEnterRuleStore.deliveryDecision(
+            forRule: rule,
+            modeAutoSendKeyIsNone: modeAutoSendKey == .none,
+            globalAutoEnterAfterTranscription: UserDefaults.standard.bool(forKey: "AutoEnterAfterTranscription"),
+            globalAppendTrailingSpace: UserDefaults.standard.bool(forKey: "AppendTrailingSpace")
+        )
+
+        let pastedText: String
+        let autoSendKey: AutoSendKey
+        if let rule {
+            pastedText = PinnedDestinationEnterRuleStore.deliveredText(
+                textToPaste, appendReturn: rule.appendReturn, appendSpace: rule.appendSpace)
+            autoSendKey = decision.submit ? .enter : .none
+        } else {
+            pastedText = textToPaste + (decision.appendSpace ? " " : "")
+            // The mode's own choice wins over the global fallback, same as before per-app rules
+            // reached this path.
+            autoSendKey = modeAutoSendKey != .none ? modeAutoSendKey : (decision.submit ? .enter : .none)
+        }
+
         SoundManager.shared.playStopSound()
         await actions.dismiss()
 
+        // `sendInsertPrefix` is only ever true when a rule was resolved, which in turn only
+        // happens when a frontmost bundle id was captured above - see `frontmostRule`.
+        if decision.sendInsertPrefix {
+            CursorPaster.performInsertModePrefix()
+            try? await Task.sleep(nanoseconds: UInt64(Self.insertModeSettleDelaySeconds * 1_000_000_000))
+        }
+
         let pasteTask = CursorPaster.startPasteAtCursor(pastedText)
 
-        var autoSendKey: AutoSendKey = output.outputMode == .paste ? output.autoSendKey : .none
-        // Global fallback: send Return unless the active mode already picked a key.
-        if autoSendKey == .none, output.outputMode == .paste,
-            UserDefaults.standard.bool(forKey: "AutoEnterAfterTranscription")
-        {
-            autoSendKey = .enter
-        }
         Task { @MainActor in
             _ = await pasteTask.value
 
