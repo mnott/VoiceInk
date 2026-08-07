@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+#
+# voiceink-target — pin an iTerm2 pane as the dictation destination, so that
+# VoiceInk writes into it without ever touching keyboard focus.
+#
+# WHY THIS EXISTS
+#
+# The usual way to insert dictated text — put it on the pasteboard and synthesise
+# Cmd+V — always lands in whatever is frontmost. That makes it impossible to
+# dictate into a terminal while reading something else. iTerm2, however, exposes a
+# scripting interface that can write into a specific session while that session
+# sits in the background. Every pane is its own session with a stable id, so a
+# pane can be addressed individually and written to without stealing focus.
+#
+# HOW A TARGET IS CHOSEN
+#
+# `pin` asks iTerm2 which session is currently selected and remembers it. It does
+# NOT need to run inside that pane — which matters, because the pane is usually
+# busy running something interactive where you cannot type a shell command. Bind
+# `pin` to a global hotkey (macOS Shortcuts, Raycast, Hammerspoon, …) and press it
+# while looking at the pane you want.
+#
+# If iTerm2 is not frontmost when you press it, the last selected session is used.
+# When the script is run from inside a pane and iTerm cannot be queried, it falls
+# back to $ITERM_SESSION_ID, which iTerm sets in every session.
+#
+# COMMANDS
+#
+#   voiceink-target pin [--no-enter] [--delay N]   make the current iTerm session the target
+#   voiceink-target unpin              clear the binding
+#   voiceink-target status             show the target and check it still exists
+#   voiceink-target send               write text from stdin into the target
+#   voiceink-target focus              bring the pinned pane to the front
+#   voiceink-target toggle [--no-enter]  pin the selected pane, or unpin if already pinned
+#
+# VOICEINK SETUP
+#
+# Create a Mode, set its Output Mode to "Custom Command", and use:
+#     <path-to-this-script> send
+# VoiceInk passes the transcript on stdin and in $VOICEINK_TRANSCRIPT. Bind that
+# Mode to a hotkey — that becomes the dictate-into-the-pinned-pane hotkey.
+#
+# NOTES
+#
+# --no-enter inserts the text without a trailing Return, so a multi-line thought
+# can be dictated in pieces and submitted by hand. Without it, each dictation is
+# submitted immediately, which is usually what you want for a REPL or an agent.
+
+set -uo pipefail
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/voiceink-target"
+STATE="$STATE_DIR/session"
+
+# A failed dictation must never vanish silently — the user is looking elsewhere
+# and would otherwise talk into the void.
+notify() {
+  osascript -e "display notification \"$1\" with title \"VoiceInk target\"" >/dev/null 2>&1
+}
+
+die() { echo "voiceink-target: $1" >&2; exit 1; }
+
+# Ask iTerm2 which session is selected right now. Works from outside iTerm and
+# does not require it to be frontmost.
+iterm_current_session() {
+  osascript -e 'tell application "iTerm2" to return (id of current session of current tab of current window)' 2>/dev/null
+}
+
+# $ITERM_SESSION_ID looks like "w2t0p0:UUID"; only the UUID is a session id.
+env_session_id() {
+  [ -n "${ITERM_SESSION_ID:-}" ] || return 1
+  printf '%s' "${ITERM_SESSION_ID#*:}"
+}
+
+read_state() {
+  [ -f "$STATE" ] || return 1
+  SID=$(sed -n 1p "$STATE")
+  ENTER=$(sed -n 2p "$STATE")
+  LABEL=$(sed -n 3p "$STATE")
+  [ -n "$SID" ] || return 1
+  [ -n "$ENTER" ] || ENTER=1
+  return 0
+}
+
+# Locate a session by id and optionally write into it.
+# argv: id, text, newline(1/0), probe-only(1/0). Prints "ok" or "gone".
+# The text travels as an argument rather than being interpolated into the script,
+# so quotes, backslashes and non-ASCII survive intact.
+iterm_write() {
+  osascript - "$1" "$2" "$3" "$4" <<'APPLESCRIPT'
+on run argv
+  set sid to item 1 of argv
+  set txt to item 2 of argv
+  set wantsNewline to (item 3 of argv is "1")
+  set probeOnly to (item 4 of argv is "1")
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (id of s) is sid then
+            if not probeOnly then
+              -- `newline yes` emits a line feed, which a shell accepts but a
+              -- raw-mode TUI (an agent REPL, an editor) does not treat as submit;
+              -- those expect a carriage return. Append CR explicitly so both work.
+              if wantsNewline then
+                tell s to write text (txt & return) newline no
+              else
+                tell s to write text txt newline no
+              end if
+            end if
+            return "ok"
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "gone"
+end run
+APPLESCRIPT
+}
+
+describe_session() {
+  osascript - "$1" <<'APPLESCRIPT' 2>/dev/null
+on run argv
+  set sid to item 1 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (id of s) is sid then return (name of s)
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "pane"
+end run
+APPLESCRIPT
+}
+
+cmd_pin() {
+  local enter=1 delay=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-enter) enter=0 ;;
+      --delay)    delay="${2:-5}"; shift ;;
+      --delay=*)  delay="${1#--delay=}" ;;
+    esac
+    shift
+  done
+
+  # Without a global hotkey there is no way to pin a pane you cannot type in:
+  # running this in pane B would pin pane B, because that is the selected one.
+  # The delay breaks that circle — start it anywhere, then click the pane you want.
+  if [ "$delay" -gt 0 ] 2>/dev/null; then
+    echo "Click the pane you want within ${delay}s …"
+    local i="$delay"
+    while [ "$i" -gt 0 ]; do printf '\r  %ds ' "$i"; sleep 1; i=$((i-1)); done
+    printf '\r        \r'
+  fi
+
+  local sid
+  sid=$(iterm_current_session)
+  if [ -z "$sid" ]; then
+    sid=$(env_session_id) || die "could not determine an iTerm session — is iTerm2 running?"
+  fi
+
+  mkdir -p "$STATE_DIR"
+  local label
+  label=$(describe_session "$sid")
+  [ -n "$label" ] || label="pane"
+  printf '%s\n%s\n%s\n' "$sid" "$enter" "$label" > "$STATE"
+
+  echo "Target set: $label"
+  echo "  session $sid"
+  if [ "$enter" = "1" ]; then
+    echo "  dictation is submitted with Return (use 'pin --no-enter' to insert without)"
+  else
+    echo "  dictation is inserted WITHOUT Return — submit it yourself"
+  fi
+}
+
+cmd_unpin() {
+  if [ -f "$STATE" ]; then rm -- "$STATE"; echo "Target cleared."; else echo "Nothing was pinned."; fi
+}
+
+cmd_status() {
+  if ! read_state; then echo "No target pinned."; return 0; fi
+  echo "Pinned: $LABEL"
+  echo "  session $SID"
+  [ "$ENTER" = "1" ] && echo "  submits with Return" || echo "  inserts without Return"
+  if [ "$(iterm_write "$SID" "" "0" "1")" = "ok" ]; then
+    echo "  status: session is alive"
+  else
+    echo "  status: SESSION NO LONGER EXISTS — run 'pin' again on the pane you want"
+    return 1
+  fi
+}
+
+# The counterpart to send: writing happens without focus, jumping there is explicit.
+cmd_focus() {
+  read_state || die "no target pinned"
+  local result
+  result=$(osascript - "$SID" <<'APPLESCRIPT'
+on run argv
+  set sid to item 1 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (id of s) is sid then
+            select w
+            select t
+            select s
+            activate
+            return "ok"
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "gone"
+end run
+APPLESCRIPT
+)
+  if [ "$result" != "ok" ]; then
+    notify "Pinned pane no longer exists."
+    die "session $SID no longer exists"
+  fi
+  echo "Focused $LABEL"
+}
+
+# Fallback when nothing is pinned: clipboard + Cmd+V into the frontmost app.
+# The clipboard is restored afterwards so dictation does not clobber what the
+# operator had copied.
+paste_to_frontmost() {
+  local saved
+  saved=$(pbpaste 2>/dev/null)
+  printf '%s' "$1" | pbcopy
+  osascript -e 'tell application "System Events" to keystroke "v" using command down' >/dev/null 2>&1
+  local rc=$?
+  ( sleep 1; printf '%s' "$saved" | pbcopy ) >/dev/null 2>&1 &
+  if [ $rc -ne 0 ]; then
+    notify "Could not paste — grant Accessibility permission to the app running this script."
+    echo "voiceink-target: paste failed (Accessibility permission?)" >&2
+    return 1
+  fi
+  echo "pasted into frontmost app (nothing pinned)"
+  return 0
+}
+
+# One hotkey for the whole workflow: pin the selected iTerm pane, or release it.
+# Pressing it while already pinned to that same pane unpins, so the same key both
+# routes dictation into a terminal and hands it back to normal pasting.
+cmd_toggle() {
+  local sid
+  sid=$(iterm_current_session)
+
+  # Not in iTerm at all — the only sensible meaning is "stop routing to a pane".
+  local front
+  front=$(osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true' 2>/dev/null)
+  if [ "$front" != "iTerm2" ] || [ -z "$sid" ]; then
+    if read_state; then
+      cmd_unpin
+      notify "Dictation unpinned — pasting into the frontmost app again."
+    else
+      notify "Not in iTerm — nothing to pin."
+      echo "not in iTerm; nothing pinned"
+    fi
+    return 0
+  fi
+
+  if read_state && [ "$SID" = "$sid" ]; then
+    cmd_unpin
+    notify "Dictation unpinned — pasting into the frontmost app again."
+    return 0
+  fi
+
+  cmd_pin "$@"
+  notify "Dictation pinned to this pane."
+}
+
+cmd_send() {
+  local text
+  text=$(cat)
+  [ -n "$text" ] || text="${VOICEINK_TRANSCRIPT:-}"
+  if [ -z "$text" ]; then
+    notify "Empty transcript — nothing written."
+    die "empty transcript"
+  fi
+
+  # Nothing pinned means "behave normally": paste into whatever is frontmost, the
+  # same as VoiceInk's own Paste output mode. Without this, a single Mode could not
+  # serve both the pinned terminal and everyday dictation into mail or a browser —
+  # VoiceInk does not fall back on its own when a custom command fails.
+  if ! read_state; then
+    paste_to_frontmost "$text"
+    exit $?
+  fi
+
+  local result
+  result=$(iterm_write "$SID" "$text" "$ENTER" "0")
+  if [ "$result" != "ok" ]; then
+    notify "Pinned pane no longer exists — dictation NOT delivered."
+    die "session $SID no longer exists"
+  fi
+  echo "delivered to $LABEL"
+}
+
+case "${1:-status}" in
+  pin)    shift; cmd_pin "$@" ;;
+  unpin)  cmd_unpin ;;
+  status) cmd_status ;;
+  send)   cmd_send ;;
+  focus)  cmd_focus ;;
+  toggle) shift 2>/dev/null; cmd_toggle "$@" ;;
+  -h|--help) sed -n '3,48p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *)      die "unknown command '${1}'. Use: pin, unpin, status, send, focus" ;;
+esac

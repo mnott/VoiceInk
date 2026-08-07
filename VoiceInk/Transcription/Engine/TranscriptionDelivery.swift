@@ -28,6 +28,11 @@ final class TranscriptionDelivery {
             return
         }
 
+        if PinnedDestinationManager.shared.pinned != nil {
+            await deliverToPinnedDestination(request, actions: actions)
+            return
+        }
+
         if request.isAssistantFollowUp {
             await deliverFollowUp(request, actions: actions)
             return
@@ -50,6 +55,23 @@ final class TranscriptionDelivery {
         } else {
             await actions.dismiss()
         }
+    }
+
+    /// Routes delivery to the pinned destination instead of `CursorPaster`, which
+    /// pastes into whatever is frontmost - the opposite of what a pin is for, since
+    /// the pin exists precisely so the user can look elsewhere while dictating.
+    private func deliverToPinnedDestination(_ item: Request, actions: Actions) async {
+        guard let text = item.text else {
+            SoundManager.shared.playStopSound()
+            await actions.dismiss()
+            return
+        }
+
+        let textToDeliver = deliverableText(from: text)
+        SoundManager.shared.playStopSound()
+        await actions.dismiss()
+
+        await PinnedDestinationManager.shared.deliver(text: textToDeliver)
     }
 
     private func deliverFollowUp(_ item: Request, actions: Actions) async {

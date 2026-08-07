@@ -18,6 +18,7 @@ struct MenuBarView: View {
     @EnvironmentObject var aiService: AIService
     @ObservedObject private var modeManager = ModeManager.shared
     @ObservedObject var audioDeviceManager = AudioDeviceManager.shared
+    @ObservedObject private var pinnedDestinationManager = PinnedDestinationManager.shared
     @AppStorage("hasCompletedOnboardingV2") private var hasCompletedOnboardingV2 = false
     @State private var launchAtLoginEnabled = LaunchAtLogin.isEnabled
 
@@ -49,6 +50,19 @@ struct MenuBarView: View {
         Group {
             Button("Toggle Recorder") {
                 recorderUIManager.handleToggleRecorderPanelNotification()
+            }
+
+            if let pinned = pinnedDestinationManager.pinned {
+                Divider()
+
+                // `displayLabel`, not `appName`: with several iTerm2 panes open, the app
+                // name alone can't tell the user which one is pinned.
+                Text(String(format: String(localized: "Pinned: %@"), pinned.displayLabel))
+                    .foregroundColor(.secondary)
+
+                Button("Unpin") {
+                    pinnedDestinationManager.unpin(notify: true)
+                }
             }
 
             Divider()

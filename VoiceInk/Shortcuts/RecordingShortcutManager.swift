@@ -288,6 +288,8 @@ class RecordingShortcutManager: ObservableObject {
             )
         case .quickAddToDictionary:
             DictionaryQuickAddManager.shared.toggle(modelContainer: engine.modelContext.container)
+        case .pinDestination:
+            await PinnedDestinationManager.shared.toggle()
         default:
             break
         }

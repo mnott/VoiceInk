@@ -149,6 +149,8 @@ struct SettingsView: View {
                 }
             }
 
+            PinnedDestinationSettingsSection()
+
             Section("Pasting") {
                 ExpandableSettingsRow(
                     isExpanded: $isRestoreClipboardExpanded,

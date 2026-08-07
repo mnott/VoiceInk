@@ -12,6 +12,16 @@ enum RecorderDisplaySettingsKeys {
     static let showLiveTranscript = "ShowLiveTranscript"
 }
 
+enum PinnedDestinationSettingsKeys {
+    /// Whether a pinned iTerm2 session gets its badge variable marked while pinned - see
+    /// `PinnedDestinationManager`'s "iTerm2 session marking" section for the full mechanism.
+    /// Defaults to off (see `AppDefaults.registerDefaults` below): this writes to the user's
+    /// terminal session via AppleScript, and even though it is invisible unless their iTerm2
+    /// profile's Badge Text already references it, an app should not start touching terminal
+    /// session state the user never asked for without an explicit opt-in.
+    static let markPinnedITermSessionWithBadge = "MarkPinnedITermSessionWithBadge"
+}
+
 enum AppDefaults {
     static func registerDefaults() {
         UserDefaults.standard.register(defaults: [
@@ -48,6 +58,9 @@ enum AppDefaults {
             CleanupSettingsKeys.transcriptionRetentionMinutes: 1440,
             CleanupSettingsKeys.isAudioCleanupEnabled: false,
             CleanupSettingsKeys.audioRetentionPeriod: 7,
+
+            // Pinned Destination
+            PinnedDestinationSettingsKeys.markPinnedITermSessionWithBadge: false,
 
             // UI & Behavior
             "IsMenuBarOnly": false,

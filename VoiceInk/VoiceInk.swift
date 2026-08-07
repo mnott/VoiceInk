@@ -23,6 +23,7 @@ struct VoiceInkApp: App {
     @StateObject private var aiService = AIService()
     @StateObject private var enhancementService: AIEnhancementService
     @StateObject private var activeWindowService = ActiveWindowService.shared
+    @StateObject private var pinnedDestinationManager = PinnedDestinationManager.shared
     @AppStorage("hasCompletedOnboardingV2") private var hasCompletedOnboardingV2 = false
     @AppStorage("enableAnnouncements") private var enableAnnouncements = true
     @State private var showMenuBarIcon = true
@@ -388,7 +389,11 @@ struct VoiceInkApp: App {
                 return $0
             }(NSImage(named: "menuBarIcon")!)
 
-            Image(nsImage: image)
+            // The menu bar renders this label as a TEMPLATE image - the system flattens
+            // it to a monochrome mask, which discards SwiftUI backgrounds and colours.
+            // So a `.background` here would never appear; the pinned state has to be
+            // composited into the image itself, with template rendering switched off.
+            Image(nsImage: pinnedDestinationManager.pinned == nil ? image : Self.pinnedMenuBarIcon(from: image))
                 .background(MainWindowRequestBridge(menuBarManager: menuBarManager))
         }
         .menuBarExtraStyle(.menu)
@@ -431,6 +436,37 @@ struct VoiceInkApp: App {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
             NSWorkspace.shared.open(url)
         }
+    }
+
+    /// Draws the menu bar icon onto a filled backdrop so an active pin is obvious at a
+    /// glance. Dictation is delivered to the pinned window rather than wherever you are
+    /// looking, so mistaking the state sends text into the wrong place - the indicator
+    /// has to be readable without hunting for it.
+    private static func pinnedMenuBarIcon(from base: NSImage) -> NSImage {
+        let inset = CGSize(width: 8, height: 3)
+        let iconRect = NSRect(origin: CGPoint(x: inset.width / 2, y: inset.height / 2), size: base.size)
+        let size = CGSize(width: base.size.width + inset.width, height: base.size.height + inset.height)
+
+        // The source icon is a black template mask, which would be near-invisible on a
+        // saturated backdrop, so recolour it before compositing.
+        let lightIcon = NSImage(size: base.size)
+        lightIcon.lockFocus()
+        base.draw(in: NSRect(origin: .zero, size: base.size))
+        NSColor.white.set()
+        NSRect(origin: .zero, size: base.size).fill(using: .sourceAtop)
+        lightIcon.unlockFocus()
+
+        let composed = NSImage(size: size)
+        composed.lockFocus()
+        NSColor.systemGreen.setFill()
+        NSBezierPath(roundedRect: NSRect(origin: .zero, size: size), xRadius: 4, yRadius: 4).fill()
+        lightIcon.draw(in: iconRect)
+        composed.unlockFocus()
+
+        // Opting out of template rendering is what preserves the colour; a template
+        // image is flattened to a monochrome mask by the menu bar.
+        composed.isTemplate = false
+        return composed
     }
 }
 

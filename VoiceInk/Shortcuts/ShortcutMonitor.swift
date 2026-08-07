@@ -24,6 +24,12 @@ final class ShortcutMonitor {
     private var onShortcutInterrupted: ((ShortcutAction, TimeInterval) -> Void)?
     private var eventTap: CFMachPort?
     private var eventTapRunLoopSource: CFRunLoopSource?
+    private var eventTapThread: Thread?
+    private var eventTapRunLoop: CFRunLoop?
+    /// Guards all mutable shortcut state. The tap callback runs on `eventTapThread`
+    /// while `start`/`stop` run on the caller's (main) thread, so every access to
+    /// `shortcuts`/`interruptibleActions`/the handler closures goes through this lock.
+    private let stateLock = NSLock()
     private let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "ShortcutMonitor")
 
     private static let shortcutInterruptionWindow: TimeInterval = 1.0
@@ -42,38 +48,51 @@ final class ShortcutMonitor {
     ) -> Bool {
         stop()
 
+        stateLock.lock()
         for (action, shortcut) in shortcuts {
             self.shortcuts[action] = ShortcutState(shortcut: shortcut)
         }
 
-        guard !self.shortcuts.isEmpty else {
-            return true
-        }
-
+        let isEmpty = self.shortcuts.isEmpty
         self.interruptibleActions = interruptibleActions
         self.onKeyDown = onKeyDown
         self.onKeyUp = onKeyUp
         self.onShortcutInterrupted = onShortcutInterrupted
+        stateLock.unlock()
+
+        guard !isEmpty else {
+            return true
+        }
 
         return installEventTap()
     }
 
     func stop() {
-        if let eventTapRunLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), eventTapRunLoopSource, .commonModes)
-            self.eventTapRunLoopSource = nil
-        }
-
-        if let eventTap {
-            CFMachPortInvalidate(eventTap)
-            self.eventTap = nil
-        }
-
+        stateLock.lock()
+        let runLoop = eventTapRunLoop
+        let source = eventTapRunLoopSource
+        let tap = eventTap
+        eventTapRunLoop = nil
+        eventTapRunLoopSource = nil
+        eventTap = nil
+        eventTapThread = nil
         shortcuts = [:]
         interruptibleActions = []
         onKeyDown = nil
         onKeyUp = nil
         onShortcutInterrupted = nil
+        stateLock.unlock()
+
+        if let runLoop {
+            if let source {
+                CFRunLoopRemoveSource(runLoop, source, .commonModes)
+            }
+            CFRunLoopStop(runLoop)
+        }
+
+        if let tap {
+            CFMachPortInvalidate(tap)
+        }
     }
 
     private func installEventTap() -> Bool {
@@ -86,7 +105,10 @@ final class ShortcutMonitor {
 
             if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
                 monitor.resetPressedShortcutsAfterTapInterruption()
-                if let eventTap = monitor.eventTap {
+                monitor.stateLock.lock()
+                let eventTap = monitor.eventTap
+                monitor.stateLock.unlock()
+                if let eventTap {
                     CGEvent.tapEnable(tap: eventTap, enable: true)
                 }
                 return Unmanaged.passUnretained(event)
@@ -116,10 +138,41 @@ final class ShortcutMonitor {
             return false
         }
 
+        stateLock.lock()
         self.eventTap = eventTap
         eventTapRunLoopSource = source
-        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
-        CGEvent.tapEnable(tap: eventTap, enable: true)
+        stateLock.unlock()
+
+        // The tap's run-loop source lives on a DEDICATED thread, never the main run
+        // loop. This tap is an active tap on the session event stream: every keystroke
+        // on the machine waits for this callback, so servicing it from the main run
+        // loop couples system-wide keyboard input to this app's main thread - any
+        // main-thread stall (model loading, a hung dialog, a debugger pause) then
+        // freezes typing everywhere, and because the timeout-recovery branch above
+        // also ran on the blocked loop, it could never re-enable the tap, making the
+        // freeze permanent until this process was killed. This has locked up the whole
+        // machine in live use - do not move the source back to the main run loop.
+        let readySemaphore = DispatchSemaphore(value: 0)
+        let thread = Thread { [weak self] in
+            guard let self else {
+                readySemaphore.signal()
+                return
+            }
+            self.stateLock.lock()
+            self.eventTapRunLoop = CFRunLoopGetCurrent()
+            self.stateLock.unlock()
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+            CGEvent.tapEnable(tap: eventTap, enable: true)
+            readySemaphore.signal()
+            CFRunLoopRun()
+        }
+        thread.name = "com.prakashjoshipax.voiceink.shortcut-event-tap"
+        thread.qualityOfService = .userInteractive
+        stateLock.lock()
+        eventTapThread = thread
+        stateLock.unlock()
+        thread.start()
+        readySemaphore.wait()
         return true
     }
 
@@ -139,6 +192,9 @@ final class ShortcutMonitor {
     }
 
     private func resetPressedShortcutsAfterTapInterruption() {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+
         let eventTime = ProcessInfo.processInfo.systemUptime
         let pressedActions = shortcuts.compactMap { action, state in
             state.isDown ? action : nil
@@ -165,6 +221,12 @@ final class ShortcutMonitor {
         modifierFlags: NSEvent.ModifierFlags,
         eventTime: TimeInterval
     ) -> Bool {
+        // Runs on the dedicated tap thread while start()/stop() mutate the same state
+        // from the main thread. The handler closures fired by dispatch* still hop to
+        // the main queue, so holding the lock here never waits on user-level work.
+        stateLock.lock()
+        defer { stateLock.unlock() }
+
         var shouldSuppress = false
 
         if kind == .keyDown {

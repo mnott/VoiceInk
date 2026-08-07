@@ -99,4 +99,5 @@ Icon
 .AppleDesktop
 Network Trash Folder
 Temporary Items
-.apdisk 
+.apdisk default.profraw
+.local-build/

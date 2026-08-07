@@ -273,6 +273,10 @@ enum ShortcutMigration {
             return ["mode_\(id.uuidString)", "powerMode_\(id.uuidString)"]
         case .recorderPanelEscape, .recorderPanelMode:
             return []
+        // Introduced after the legacy KeyboardShortcuts storage was retired, so
+        // there is nothing to migrate from.
+        case .pinDestination:
+            return []
         }
     }
 
