@@ -26,6 +26,13 @@ struct VoiceInkApp: App {
     @StateObject private var pinnedDestinationManager = PinnedDestinationManager.shared
     @AppStorage("hasCompletedOnboardingV2") private var hasCompletedOnboardingV2 = false
     @AppStorage("enableAnnouncements") private var enableAnnouncements = true
+    // Read here (rather than fetched from `UserDefaults` inside `pinnedMenuBarIcon`) so a
+    // color change made in Settings while a pin is already active re-renders the label:
+    // MenuBarExtra's label only redraws when a value it reads through SwiftUI storage
+    // changes, and a plain `UserDefaults` read inside a static helper is invisible to that.
+    @AppStorage(PinnedDestinationSettingsKeys.pinnedITermTintColorHex)
+    private var pinnedITermTintColorHex = PinnedDestinationManager.hexString(
+        fromITermColor: PinnedDestinationManager.defaultPinnedBackgroundColor)
     @State private var showMenuBarIcon = true
     @State private var didShowLaunchReminders = false
 
@@ -393,7 +400,10 @@ struct VoiceInkApp: App {
             // it to a monochrome mask, which discards SwiftUI backgrounds and colours.
             // So a `.background` here would never appear; the pinned state has to be
             // composited into the image itself, with template rendering switched off.
-            Image(nsImage: pinnedDestinationManager.pinned == nil ? image : Self.pinnedMenuBarIcon(from: image))
+            Image(
+                nsImage: pinnedDestinationManager.pinned == nil
+                    ? image : Self.pinnedMenuBarIcon(from: image, tintHex: pinnedITermTintColorHex)
+            )
                 .background(MainWindowRequestBridge(menuBarManager: menuBarManager))
         }
         .menuBarExtraStyle(.menu)
@@ -442,25 +452,58 @@ struct VoiceInkApp: App {
     /// glance. Dictation is delivered to the pinned window rather than wherever you are
     /// looking, so mistaking the state sends text into the wrong place - the indicator
     /// has to be readable without hunting for it.
-    private static func pinnedMenuBarIcon(from base: NSImage) -> NSImage {
+    ///
+    /// `tintHex` is passed in by the caller (from `@AppStorage(PinnedDestinationSettingsKeys
+    /// .pinnedITermTintColorHex)`) rather than read from `UserDefaults` here, precisely so a
+    /// color change made while a pin is active is visible: SwiftUI only re-renders this
+    /// label when a value it reads through `@State`/`@AppStorage`/`@ObservedObject`
+    /// changes, and a `UserDefaults` read buried inside a plain static function is invisible
+    /// to that.
+    private static func pinnedMenuBarIcon(from base: NSImage, tintHex: String) -> NSImage {
         let inset = CGSize(width: 8, height: 3)
         let iconRect = NSRect(origin: CGPoint(x: inset.width / 2, y: inset.height / 2), size: base.size)
         let size = CGSize(width: base.size.width + inset.width, height: base.size.height + inset.height)
 
+        // The same tint the user picked for the pinned iTerm2 pane (see
+        // `PinnedDestinationManager`'s "iTerm2 session marking" section), so the menu bar
+        // and the tinted pane read as the same signal rather than two unrelated colors.
+        // Falls back to the same built-in default on a missing/malformed preference, never
+        // to a garbage color - mirrors `PinnedDestinationManager.pinnedTintColor()`'s own
+        // fallback. The stored ALPHA is deliberately ignored here: there, it means "blend
+        // the tint over the terminal pane's own background", but there is no such
+        // background behind a menu bar icon to blend over - just a plain rounded-rect fill
+        // - so the backdrop is always drawn at the chosen color, full strength.
+        let backdrop =
+            PinnedDestinationManager.itermColor(fromHexString: tintHex)?.color
+            ?? PinnedDestinationManager.defaultPinnedBackgroundColor
+        let backdropColor = NSColor(
+            srgbRed: CGFloat(backdrop.red) / 65535,
+            green: CGFloat(backdrop.green) / 65535,
+            blue: CGFloat(backdrop.blue) / 65535,
+            alpha: 1.0
+        )
+
         // The source icon is a black template mask, which would be near-invisible on a
-        // saturated backdrop, so recolour it before compositing.
-        let lightIcon = NSImage(size: base.size)
-        lightIcon.lockFocus()
+        // saturated backdrop, so recolour it before compositing. WHICH color it gets
+        // recolored to is decided FROM the backdrop (`menuBarIconForeground`) rather than
+        // hard-coded to white: white always worked against the built-in dark green, but the
+        // backdrop now follows a user-chosen tint that could just as easily be pale, where
+        // a white icon would disappear.
+        let foreground = PinnedDestinationManager.menuBarIconForeground(onBackdrop: backdrop)
+        let iconColor: NSColor = foreground == .dark ? .black : .white
+
+        let tintedIcon = NSImage(size: base.size)
+        tintedIcon.lockFocus()
         base.draw(in: NSRect(origin: .zero, size: base.size))
-        NSColor.white.set()
+        iconColor.set()
         NSRect(origin: .zero, size: base.size).fill(using: .sourceAtop)
-        lightIcon.unlockFocus()
+        tintedIcon.unlockFocus()
 
         let composed = NSImage(size: size)
         composed.lockFocus()
-        NSColor.systemGreen.setFill()
+        backdropColor.setFill()
         NSBezierPath(roundedRect: NSRect(origin: .zero, size: size), xRadius: 4, yRadius: 4).fill()
-        lightIcon.draw(in: iconRect)
+        tintedIcon.draw(in: iconRect)
         composed.unlockFocus()
 
         // Opting out of template rendering is what preserves the colour; a template

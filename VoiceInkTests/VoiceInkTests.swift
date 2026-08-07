@@ -653,6 +653,159 @@ struct PinnedDestinationITermColorTests {
     }
 }
 
+// MARK: - Pinned Destination: hex <-> ITermColor conversion (user-chosen tint color)
+
+struct PinnedDestinationITermTintHexConversionTests {
+    @Test func blackHexParsesToAllZeroComponents() {
+        let tint = PinnedDestinationManager.itermColor(fromHexString: "000000")
+        #expect(
+            tint
+                == PinnedDestinationManager.ITermTintColor(
+                    color: PinnedDestinationManager.ITermColor(red: 0, green: 0, blue: 0), alpha: 1.0))
+    }
+
+    @Test func whiteHexParsesToFullScaleComponents() {
+        // The case that catches the classic off-by-a-bit trap: 0xFF must scale to 65535 (the
+        // true top of iTerm2's 16-bit range) via *257, not to 65280 (0xFF00) via *256/<<8 -
+        // that shift-based version is never obviously wrong, it just quietly desaturates every
+        // color pulled through it.
+        let tint = PinnedDestinationManager.itermColor(fromHexString: "FFFFFF")
+        #expect(
+            tint
+                == PinnedDestinationManager.ITermTintColor(
+                    color: PinnedDestinationManager.ITermColor(red: 65535, green: 65535, blue: 65535), alpha: 1.0))
+    }
+
+    @Test func acceptsALeadingHash() {
+        let tint = PinnedDestinationManager.itermColor(fromHexString: "#000000")
+        #expect(
+            tint
+                == PinnedDestinationManager.ITermTintColor(
+                    color: PinnedDestinationManager.ITermColor(red: 0, green: 0, blue: 0), alpha: 1.0))
+    }
+
+    @Test func sixDigitHexStillParsesAsFullyOpaque() {
+        // Backward compatibility: every hex string stored before opacity existed as a setting
+        // (and the registered built-in default before this change) is 6 digits, and must keep
+        // parsing exactly as before - as fully opaque - rather than becoming unparseable.
+        let tint = PinnedDestinationManager.itermColor(fromHexString: "062312")
+        #expect(tint?.alpha == 1.0)
+        #expect(
+            tint?.color
+                == PinnedDestinationManager.ITermColor(
+                    red: 6 * 257, green: 0x23 * 257, blue: 0x12 * 257))
+    }
+
+    @Test func eightDigitHexParsesColorAndAlpha() {
+        // 0x80 / 255 is the mid-opacity case a user actually picks from the color well.
+        let tint = PinnedDestinationManager.itermColor(fromHexString: "FF000080")
+        #expect(
+            tint?.color == PinnedDestinationManager.ITermColor(red: 65535, green: 0, blue: 0))
+        #expect(tint.map { abs($0.alpha - (128.0 / 255.0)) < 0.0001 } == true)
+    }
+
+    @Test func rejectsMalformedInput() {
+        // Every one of these must fail rather than guess: an unparseable stored preference is
+        // exactly the case `pinnedTintColor()` handles by falling back to the built-in default,
+        // never by applying a garbage color derived from whatever partial parse happened.
+        #expect(PinnedDestinationManager.itermColor(fromHexString: "") == nil)
+        #expect(PinnedDestinationManager.itermColor(fromHexString: "GGGGGG") == nil)
+        #expect(PinnedDestinationManager.itermColor(fromHexString: "FFF") == nil)
+        #expect(PinnedDestinationManager.itermColor(fromHexString: "FFFFFFF") == nil)
+        #expect(PinnedDestinationManager.itermColor(fromHexString: "FFFFFFFFF") == nil)
+    }
+
+    @Test func roundTripsThroughHex() {
+        // Components chosen as exact multiples of 257 (10 * 257, 200 * 257, 255 * 257) so the
+        // ITermColor -> hex -> ITermColor round trip lands back on the exact original value,
+        // not merely an equivalent-looking one - any off-by-one in the scale/round pairing would
+        // show up here as a component that's off by exactly 257.
+        let original = PinnedDestinationManager.ITermColor(red: 2570, green: 51400, blue: 65535)
+        let hex = PinnedDestinationManager.hexString(fromITermColor: original, alpha: 0.5)
+        let tint = PinnedDestinationManager.itermColor(fromHexString: hex)
+        #expect(tint?.color == original)
+        #expect(tint.map { abs($0.alpha - 0.5) < 0.01 } == true)
+    }
+}
+
+// MARK: - Pinned Destination: alpha-blending the tint over the pane's original background
+
+struct PinnedDestinationITermTintBlendTests {
+    private static let tint = PinnedDestinationManager.ITermColor(red: 65535, green: 0, blue: 0)
+    private static let background = PinnedDestinationManager.ITermColor(red: 0, green: 0, blue: 65535)
+
+    @Test func alphaOneReturnsTintUnchanged() {
+        let blended = PinnedDestinationManager.blended(tint: Self.tint, alpha: 1.0, over: Self.background)
+        #expect(blended == Self.tint)
+    }
+
+    @Test func alphaZeroReturnsBackgroundUnchanged() {
+        let blended = PinnedDestinationManager.blended(tint: Self.tint, alpha: 0.0, over: Self.background)
+        #expect(blended == Self.background)
+    }
+
+    @Test func alphaHalfOverBlackGivesHalfTheTintsComponents() {
+        let black = PinnedDestinationManager.ITermColor(red: 0, green: 0, blue: 0)
+        let tint = PinnedDestinationManager.ITermColor(red: 65535, green: 30000, blue: 1000)
+        let blended = PinnedDestinationManager.blended(tint: tint, alpha: 0.5, over: black)
+        // 65535 * 0.5 = 32767.5 -> rounds to 32768; 30000 * 0.5 = 15000; 1000 * 0.5 = 500.
+        #expect(blended == PinnedDestinationManager.ITermColor(red: 32768, green: 15000, blue: 500))
+    }
+
+    @Test func alphaIsClampedToValidRange() {
+        let tooLow = PinnedDestinationManager.blended(tint: Self.tint, alpha: -1, over: Self.background)
+        #expect(tooLow == Self.background)
+
+        let tooHigh = PinnedDestinationManager.blended(tint: Self.tint, alpha: 2, over: Self.background)
+        #expect(tooHigh == Self.tint)
+    }
+}
+
+// MARK: - Pinned Destination: menu bar icon foreground legibility
+
+struct PinnedDestinationMenuBarIconForegroundTests {
+    @Test func builtInDarkGreenChoosesLightForeground() {
+        // The built-in default backdrop (see `PinnedDestinationManager.defaultPinnedBackgroundColor`)
+        // is a deliberately DARK green, chosen so light text/icon stays legible on it - this
+        // is the case the icon was hard-coded white for before it followed the user's tint.
+        let foreground = PinnedDestinationManager.menuBarIconForeground(
+            onBackdrop: PinnedDestinationManager.defaultPinnedBackgroundColor)
+        #expect(foreground == .light)
+    }
+
+    @Test func pureBlackChoosesLightForeground() {
+        let foreground = PinnedDestinationManager.menuBarIconForeground(
+            onBackdrop: PinnedDestinationManager.ITermColor(red: 0, green: 0, blue: 0))
+        #expect(foreground == .light)
+    }
+
+    @Test func pureWhiteChoosesDarkForeground() {
+        let foreground = PinnedDestinationManager.menuBarIconForeground(
+            onBackdrop: PinnedDestinationManager.ITermColor(red: 65535, green: 65535, blue: 65535))
+        #expect(foreground == .dark)
+    }
+
+    @Test func paleYellowChoosesDarkForeground() {
+        // A bright, low-saturation backdrop a user might plausibly pick from the color well -
+        // covers the case the old hard-coded-white icon would have gotten wrong (invisible on
+        // a pale tint), which is the entire reason the foreground now has to be decided rather
+        // than assumed.
+        let paleYellow = PinnedDestinationManager.ITermColor(red: 65535, green: 65535, blue: 51400)
+        let foreground = PinnedDestinationManager.menuBarIconForeground(onBackdrop: paleYellow)
+        #expect(foreground == .dark)
+    }
+
+    @Test func midGreyLandsOnTheDarkSideOfTheThreshold() {
+        // 32768 is just over half of the 0...65535 range (65535 / 2 = 32767.5), so this grey's
+        // luma comes out to ~0.500008 - a hair above the 0.5 threshold. Asserting the actual
+        // computed side (`.dark`) rather than assuming which way a "mid" grey should fall,
+        // per `menuBarIconForeground`'s own `>` (not `>=`) threshold.
+        let midGrey = PinnedDestinationManager.ITermColor(red: 32768, green: 32768, blue: 32768)
+        let foreground = PinnedDestinationManager.menuBarIconForeground(onBackdrop: midGrey)
+        #expect(foreground == .dark)
+    }
+}
+
 // MARK: - Pinned Destination: iTerm2 write result classification
 
 struct PinnedDestinationITermWriteResultTests {

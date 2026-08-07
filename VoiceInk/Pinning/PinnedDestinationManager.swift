@@ -1002,14 +1002,106 @@ final class PinnedDestinationManager: ObservableObject {
     // applied at all unless that capture succeeded - see `markITermSessionPinned`. Restoring a
     // color VoiceInk never read would be a worse outcome than not tinting in the first place.
 
-    /// Background color applied to a pinned session, as iTerm2's 16-bit RGB components. A deep,
-    /// desaturated green - the same signal as the menu bar icon's green backdrop, not an
-    /// unrelated color. Kept DARK rather than pale on purpose: this sits behind the user's real
-    /// terminal content for as long as the pin lasts, and terminal schemes are overwhelmingly
-    /// light text on a dark background, so a pale tint inverts the contrast the scheme was built
-    /// around and makes the pane hard to read. Dark enough to leave light foreground text
-    /// legible, green enough to be unmistakable next to an untinted pane.
-    private static let iTermPinnedBackgroundColor = ITermColor(red: 1500, green: 9000, blue: 4500)
+    /// Fallback background color applied to a pinned session, as iTerm2's 16-bit RGB components,
+    /// used whenever `PinnedDestinationSettingsKeys.pinnedITermTintColorHex` is missing or fails
+    /// to parse (see `pinnedTintColor()`) - and, via `hexString(fromITermColor:)`, to seed that
+    /// preference's registered default (see `AppDefaults.registerDefaults`), so anyone who never
+    /// opens the color picker still gets this color. A deep, desaturated green - the same signal
+    /// as the menu bar icon's green backdrop, not an unrelated color. Kept DARK rather than pale
+    /// on purpose: this sits behind the user's real terminal content for as long as the pin
+    /// lasts, and terminal schemes are overwhelmingly light text on a dark background, so a pale
+    /// tint inverts the contrast the scheme was built around and makes the pane hard to read.
+    /// Dark enough to leave light foreground text legible, green enough to be unmistakable next
+    /// to an untinted pane. `nonisolated` so it (and the hex conversion built on it) can be read
+    /// from `AppDefaults.registerDefaults`, which runs before the app is necessarily on the main
+    /// actor.
+    nonisolated static let defaultPinnedBackgroundColor = ITermColor(red: 1500, green: 9000, blue: 4500)
+
+    /// The color (and opacity) to apply to a pinned session's background: the user's stored
+    /// preference if present and parseable, otherwise `defaultPinnedBackgroundColor` at full
+    /// opacity. Never crashes and never applies garbage - a malformed or missing preference
+    /// silently falls back rather than tinting the user's terminal with whatever
+    /// `itermColor(fromHexString:)` happened to produce from bad input (which is nil, not a
+    /// garbage color, but the fallback here is what actually keeps `markITermSessionPinned` from
+    /// having to special-case that).
+    private func pinnedTintColor() -> ITermTintColor {
+        guard
+            let hex = UserDefaults.standard.string(forKey: PinnedDestinationSettingsKeys.pinnedITermTintColorHex),
+            let tint = Self.itermColor(fromHexString: hex)
+        else {
+            return ITermTintColor(color: Self.defaultPinnedBackgroundColor, alpha: 1.0)
+        }
+        return tint
+    }
+
+    /// An 8-bit color channel (0...255, what both hex strings and SwiftUI's `Color` use) scales
+    /// up to iTerm2's 16-bit component (0...65535) by multiplying by 257, NOT by 256 or by
+    /// bit-shifting left 8. 255 * 257 = 65535 exactly - the full range top maps to the full range
+    /// top. The tempting-looking `<< 8` (equivalent to * 256) instead tops out at 65280, which is
+    /// off-white rather than white and, worse, is never wrong enough to look obviously broken -
+    /// it just quietly desaturates every color pulled through it. 257 is exactly 65535 / 255.
+    nonisolated private static let componentScale16From8 = 257
+
+    /// Parses a 6-digit "RRGGBB" or 8-digit "RRGGBBAA" hex string (an optional leading "#" is
+    /// accepted) into iTerm2's 16-bit RGB components plus the opacity to blend that color at (see
+    /// `ITermTintColor`), applying the *257 upscale documented on `componentScale16From8` to the
+    /// RGB portion. The 6-digit form is kept accepting on its own - not merely as a historical
+    /// compatibility shim - because it is exactly what's already sitting in every existing stored
+    /// preference and in the registered default: it always means fully opaque (alpha 1.0), same
+    /// as the tint always was before opacity existed as a concept. Returns nil for anything else -
+    /// wrong length, non-hex characters, empty input - rather than guessing, mirroring
+    /// `parseITermColor`'s same refusal-over-guessing stance just above. `nonisolated static` so
+    /// this pure parser is unit-testable synchronously, same as the other parsers in this file.
+    nonisolated static func itermColor(fromHexString hex: String) -> ITermTintColor? {
+        var digits = hex
+        if digits.hasPrefix("#") {
+            digits.removeFirst()
+        }
+
+        switch digits.count {
+        case 6:
+            guard let value = UInt32(digits, radix: 16) else { return nil }
+            return ITermTintColor(color: color(fromRGB24: value), alpha: 1.0)
+        case 8:
+            guard let value = UInt32(digits, radix: 16) else { return nil }
+            let alphaComponent = Int(value & 0xFF)
+            return ITermTintColor(color: color(fromRGB24: value >> 8), alpha: Double(alphaComponent) / 255.0)
+        default:
+            return nil
+        }
+    }
+
+    /// Shared by both branches of `itermColor(fromHexString:)`: unpacks a 24-bit 0xRRGGBB value
+    /// into iTerm2's upscaled 16-bit components.
+    private nonisolated static func color(fromRGB24 value: UInt32) -> ITermColor {
+        let red = Int((value >> 16) & 0xFF)
+        let green = Int((value >> 8) & 0xFF)
+        let blue = Int(value & 0xFF)
+        return ITermColor(
+            red: red * componentScale16From8,
+            green: green * componentScale16From8,
+            blue: blue * componentScale16From8
+        )
+    }
+
+    /// Renders iTerm2's 16-bit RGB components, plus an opacity, back to an 8-digit "RRGGBBAA" hex
+    /// string, downscaling each RGB channel by dividing by 257 (the inverse of
+    /// `itermColor(fromHexString:)`'s upscale) and rounding to the nearest 8-bit value rather than
+    /// truncating, so a color built FROM a hex string round-trips back to that exact same string.
+    /// `alpha` defaults to fully opaque so every pre-existing call site (the registered default in
+    /// `AppDefaults`, chiefly) keeps emitting a valid hex string without having to think about
+    /// opacity at all. `nonisolated static` for the same reason as its inverse above.
+    nonisolated static func hexString(fromITermColor color: ITermColor, alpha: Double = 1.0) -> String {
+        func component(_ value: Int) -> Int {
+            let clamped = min(max(value, 0), 65535)
+            return Int((Double(clamped) / Double(componentScale16From8)).rounded())
+        }
+        let alphaComponent = Int((min(max(alpha, 0), 1) * 255).rounded())
+        return String(
+            format: "%02X%02X%02X%02X",
+            component(color.red), component(color.green), component(color.blue), alphaComponent
+        )
+    }
 
     /// The currently-tinted session, if any: its id, and the background color it had immediately
     /// before VoiceInk overwrote it, so unmarking can put back exactly what was there. Kept
@@ -1018,11 +1110,93 @@ final class PinnedDestinationManager: ObservableObject {
     /// identity/equality or ripple into every existing call site that pattern-matches that case.
     private var activeITermMarking: (sessionID: String, previousBackgroundColor: ITermColor)?
 
-    /// An iTerm2 color as the three 16-bit components its scripting interface uses.
+    /// An iTerm2 color as the three 16-bit components its scripting interface uses. Always
+    /// OPAQUE - iTerm2's `background color` property has no alpha channel, so every value of
+    /// this type is something that can be written to it directly via
+    /// `setBackgroundColorStatement`. This is exactly why opacity is not a fourth field here:
+    /// see `ITermTintColor` and `blended(tint:alpha:over:)` for where opacity actually lives.
     struct ITermColor: Equatable {
         let red: Int
         let green: Int
         let blue: Int
+    }
+
+    /// A user-chosen tint plus the opacity to apply it at, together as parsed from the stored
+    /// "RRGGBBAA" preference (see `itermColor(fromHexString:)`). Kept as its own small type
+    /// rather than adding an `alpha` field to `ITermColor` itself, because `ITermColor` means "an
+    /// opaque iTerm2 color, ready to write" everywhere else it's used (the captured original
+    /// background, the fully-blended result) - folding alpha into it would let a caller pass a
+    /// partially-transparent value straight to `setBackgroundColorStatement`, which has nowhere
+    /// to put it (see the OPACITY discussion above `markITermSessionPinned`).
+    struct ITermTintColor: Equatable {
+        let color: ITermColor
+        let alpha: Double
+    }
+
+    /// Alpha-blends `tint` over `background` (standard "source-over" compositing) and returns the
+    /// resulting OPAQUE color, per channel: `background * (1 - alpha) + tint * alpha`, rounded to
+    /// the nearest 16-bit component and clamped to iTerm2's 0...65535 range. This is the entire
+    /// mechanism behind the pinned-tint "opacity" setting - see the OPACITY discussion above
+    /// `markITermSessionPinned`, which is the only place this is called from. `alpha` is clamped
+    /// to 0...1 defensively, since it can originate from a hand-edited or otherwise out-of-range
+    /// stored preference. `nonisolated static` so this pure blend is unit-testable synchronously,
+    /// same as the other color math in this file.
+    nonisolated static func blended(tint: ITermColor, alpha: Double, over background: ITermColor) -> ITermColor {
+        let clampedAlpha = min(max(alpha, 0), 1)
+
+        func blend(_ tintComponent: Int, _ backgroundComponent: Int) -> Int {
+            let mixed = Double(backgroundComponent) * (1 - clampedAlpha) + Double(tintComponent) * clampedAlpha
+            return min(max(Int(mixed.rounded()), 0), 65535)
+        }
+
+        return ITermColor(
+            red: blend(tint.red, background.red),
+            green: blend(tint.green, background.green),
+            blue: blend(tint.blue, background.blue)
+        )
+    }
+
+    // MARK: - Menu bar icon foreground legibility
+
+    // The menu bar's pinned icon (see `pinnedMenuBarIcon(from:tintHex:)` in VoiceInk.swift)
+    // now fills its backdrop with the same tint the user picked for the pinned iTerm2 pane,
+    // rather than a hard-coded green. The icon artwork itself is just a black-or-white mask,
+    // and it used to be forced to white unconditionally - fine against the built-in dark
+    // green, but a user-chosen tint could just as easily be pale, where a white icon would
+    // vanish. So the mask color has to be DECIDED from the backdrop, every time.
+
+    /// Which foreground reads legibly against a given backdrop - see
+    /// `menuBarIconForeground(onBackdrop:)`.
+    enum MenuBarIconForeground: Equatable {
+        case light
+        case dark
+    }
+
+    /// Picks the legible icon foreground for a given backdrop color, by relative brightness.
+    /// Uses luma - `0.299R + 0.587G + 0.114B` on the plain (non-linearised) sRGB-gamma
+    /// components, the ITU-R BT.601 weighting - rather than a flat `(R+G+B)/3` average: the
+    /// eye is far more sensitive to green than to blue, so an unweighted average calls a
+    /// saturated blue backdrop brighter than it reads and a saturated green backdrop darker
+    /// than it reads - exactly backwards for the colors a tint picker produces most often.
+    /// Working on plain gamma-encoded components rather than linearising first is a
+    /// deliberate simplification: this only needs to sort a color into one of two buckets,
+    /// not reproduce perceptually-linear brightness, and BT.601 luma is the well-known
+    /// standard for exactly that.
+    ///
+    /// Threshold at luma 0.5 - the midpoint of the 0...1 range - with the tie (an exact
+    /// 50% grey) landing on `.dark`: `>` rather than `>=` treats anywhere strictly below
+    /// mid-brightness as needing the light foreground, and includes the midpoint itself
+    /// among the "bright enough for a dark foreground" half. `nonisolated static` so this
+    /// pure decision is unit-testable synchronously, same as the other color math in this
+    /// file.
+    nonisolated static func menuBarIconForeground(onBackdrop backdrop: ITermColor) -> MenuBarIconForeground {
+        func normalized(_ component: Int) -> Double {
+            Double(min(max(component, 0), 65535)) / 65535.0
+        }
+
+        let luma =
+            0.299 * normalized(backdrop.red) + 0.587 * normalized(backdrop.green) + 0.114 * normalized(backdrop.blue)
+        return luma > 0.5 ? .dark : .light
     }
 
     /// Parses the `r,g,b` string produced by `readITermSessionBackgroundColor`'s script. The
@@ -1047,6 +1221,22 @@ final class PinnedDestinationManager: ObservableObject {
         "set background color to {\(color.red), \(color.green), \(color.blue)}"
     }
 
+    // OPACITY. The user can pick not just a tint color but how strongly it applies, and that
+    // needs to mean something specific: iTerm2's `background color` is an OPAQUE RGB triple -
+    // its scripting interface has no alpha channel to set on it at all. iTerm2 sessions do have
+    // a separate `transparency` property, but that is deliberately NOT what "opacity" means here
+    // - it makes the whole pane see-through to the desktop behind it, which has nothing to do
+    // with how strongly the TINT COLOR shows through the user's own terminal content.
+    //
+    // So opacity is implemented as alpha-blending the chosen tint over the pane's ORIGINAL
+    // background color (standard source-over, see `blended(tint:alpha:over:)`) and writing the
+    // resulting OPAQUE color - a lower opacity is a subtler wash over the existing scheme, not a
+    // transparent window. This is only possible because `previousColor` below is captured BEFORE
+    // any tinting happens; without it there would be nothing correct to blend against. A reader
+    // who has not seen this reasoning would otherwise reasonably assume alpha was simply
+    // forgotten when this method writes an opaque color despite the user having picked one with
+    // opacity < 1 - it is not forgotten, it has already been folded in by the time of the write.
+
     /// Best-effort: tints `id`'s background, first capturing the color it already had so
     /// `clearActiveITermMarkingIfNeeded` can put it back exactly. Never awaited by its caller
     /// (see the `Task { ... }` in `toggle()`) - marking is a nicety, never a precondition for
@@ -1059,7 +1249,9 @@ final class PinnedDestinationManager: ObservableObject {
         }
 
         // No capture, no tint. Applying a color VoiceInk cannot undo would leave the user's
-        // terminal permanently recolored with no way back short of reopening the pane.
+        // terminal permanently recolored with no way back short of reopening the pane. It also
+        // doubles as the base to blend the tint's opacity against - see the OPACITY discussion
+        // above.
         guard let previousColor = Self.parseITermColor(await readITermSessionBackgroundColor(id: id)) else {
             logger.notice("Skipping pinned iTerm2 session tint: could not read the session's current background color.")
             return
@@ -1067,7 +1259,9 @@ final class PinnedDestinationManager: ObservableObject {
 
         activeITermMarking = (sessionID: id, previousBackgroundColor: previousColor)
 
-        let statement = Self.setBackgroundColorStatement(Self.iTermPinnedBackgroundColor)
+        let tint = pinnedTintColor()
+        let blendedColor = Self.blended(tint: tint.color, alpha: tint.alpha, over: previousColor)
+        let statement = Self.setBackgroundColorStatement(blendedColor)
         switch Self.classifyITermWriteOutcome(await writeToITermSession(id: id, statement: statement)) {
         case .ok:
             // Recorded only after the tint actually landed, so a failed write never leaves

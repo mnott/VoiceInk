@@ -19,6 +19,19 @@ enum PinnedDestinationSettingsKeys {
     /// terminal color scheme for as long as the pin lasts, which an app should never start
     /// doing without an explicit opt-in.
     static let highlightPinnedITermSession = "HighlightPinnedITermSession"
+
+    /// The color (and opacity) applied to a pinned iTerm2 session's background, as an 8-digit
+    /// "RRGGBBAA" hex string (an optional leading "#" is accepted when reading it back, and a
+    /// 6-digit "RRGGBB" string - fully opaque - still parses too, for values stored before
+    /// opacity existed as a setting - see `PinnedDestinationManager.itermColor(fromHexString:)`).
+    /// Stored as plain 8-bit-per-channel hex rather than iTerm2's native 16-bit components because
+    /// that is what a SwiftUI `ColorPicker` naturally round-trips through; `PinnedDestinationManager`
+    /// upscales each RGB channel by 257 (0...255 -> 0...65535) when talking to iTerm2, and blends
+    /// the alpha channel against the pane's original background rather than sending it to iTerm2
+    /// at all (iTerm2's background color has no alpha channel - see the OPACITY discussion above
+    /// `PinnedDestinationManager.markITermSessionPinned`). Registered with a default below so
+    /// anyone who never opens this setting keeps seeing the original built-in green, fully opaque.
+    static let pinnedITermTintColorHex = "PinnedITermTintColorHex"
 }
 
 enum AppDefaults {
@@ -87,6 +100,10 @@ enum AppDefaults {
 
             // Pinned Destination
             PinnedDestinationSettingsKeys.highlightPinnedITermSession: false,
+            // Derived from the same constant `markITermSessionPinned` falls back to when this
+            // key is missing or unparseable, so both paths agree on "untouched" behavior.
+            PinnedDestinationSettingsKeys.pinnedITermTintColorHex: PinnedDestinationManager.hexString(
+                fromITermColor: PinnedDestinationManager.defaultPinnedBackgroundColor),
 
             // UI & Behavior
             "IsMenuBarOnly": false,

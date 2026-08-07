@@ -12,6 +12,47 @@ struct PinnedDestinationSettingsSection: View {
     @State private var selectedBundleIdentifier: String = ""
     @AppStorage(PinnedDestinationSettingsKeys.highlightPinnedITermSession)
     private var highlightPinnedITermSession = false
+    @AppStorage(PinnedDestinationSettingsKeys.pinnedITermTintColorHex)
+    private var pinnedITermTintColorHex = PinnedDestinationManager.hexString(
+        fromITermColor: PinnedDestinationManager.defaultPinnedBackgroundColor)
+
+    /// Reads/writes the tint color AND opacity preference through SwiftUI's `Color`, going via
+    /// `NSColor`'s sRGB representation rather than any other color space - `ColorPicker`'s
+    /// underlying `Color` is not guaranteed to already be sRGB, and writing un-converted
+    /// components into the "RRGGBBAA" hex string would silently store the wrong color. Opacity
+    /// round-trips as `Color`'s own alpha/opacity channel - it is NOT applied to what gets sent
+    /// to iTerm2 here; that blending happens in `PinnedDestinationManager.markITermSessionPinned`
+    /// against the pane's actual original background, which this view has no access to (see the
+    /// OPACITY discussion there for why). The getter falls back to the built-in default, fully
+    /// opaque, on a malformed/missing stored hex, mirroring
+    /// `PinnedDestinationManager.pinnedTintColor()`'s own fallback so the swatch shown here never
+    /// disagrees with what actually gets applied.
+    private var pinnedITermTintColor: Binding<Color> {
+        Binding(
+            get: {
+                let tint =
+                    PinnedDestinationManager.itermColor(fromHexString: pinnedITermTintColorHex)
+                    ?? PinnedDestinationManager.ITermTintColor(
+                        color: PinnedDestinationManager.defaultPinnedBackgroundColor, alpha: 1.0)
+                return Color(
+                    red: Double(tint.color.red) / 65535,
+                    green: Double(tint.color.green) / 65535,
+                    blue: Double(tint.color.blue) / 65535,
+                    opacity: tint.alpha
+                )
+            },
+            set: { newColor in
+                guard let sRGB = NSColor(newColor).usingColorSpace(.sRGB) else { return }
+                pinnedITermTintColorHex = String(
+                    format: "%02X%02X%02X%02X",
+                    Int((sRGB.redComponent * 255).rounded()),
+                    Int((sRGB.greenComponent * 255).rounded()),
+                    Int((sRGB.blueComponent * 255).rounded()),
+                    Int((sRGB.alphaComponent * 255).rounded())
+                )
+            }
+        )
+    }
 
     private var addableApps: [NSRunningApplication] {
         NSWorkspace.shared.runningApplications
@@ -32,13 +73,24 @@ struct PinnedDestinationSettingsSection: View {
                     .toggleStyle(.switch)
                     .controlSize(.small)
                     .help(
-                        "Give the pinned pane a pale green background while it is pinned, matching the menu bar icon, so you can spot it among many panes. The original color is restored when the pin ends."
+                        "Give the pinned pane a colored background while it is pinned, so you can spot it among many panes. The original color is restored when the pin ends."
                     )
+
+                // Hidden rather than merely disabled while the toggle is off: a visible-but-inert
+                // picker would suggest it has some effect on its own, when the toggle above is
+                // what actually turns tinting on or off.
+                if highlightPinnedITermSession {
+                    ColorPicker("Tint Color", selection: pinnedITermTintColor, supportsOpacity: true)
+                        .controlSize(.small)
+                        .help(
+                            "The background color applied to the pinned iTerm2 session while it is pinned. The opacity slider controls how strongly it blends over the pane's existing background, not how see-through the window becomes."
+                        )
+                }
             } header: {
                 Text("Pinned Destination")
             } footer: {
                 Text(
-                    "Focus something you can type into, then use this shortcut to pin it. Dictation is then delivered there without switching focus, until you toggle the pin off. When the destination is an iTerm2 session, tinting it (above) can help you spot which pane is pinned when several are open - the original background color is captured first and put back automatically when the pin changes or clears."
+                    "Focus something you can type into, then use this shortcut to pin it. Dictation is then delivered there without switching focus, until you toggle the pin off. When the destination is an iTerm2 session, tinting it (above) can help you spot which pane is pinned when several are open - pick the tint color and its opacity with the color well, and the original background color is captured first and put back automatically when the pin changes or clears. Opacity blends the tint over that original background rather than making the pane see-through, so a lower value gives a subtler wash of color instead of a transparent window."
                 )
                 .font(.caption)
                 .foregroundColor(.secondary)
