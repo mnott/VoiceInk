@@ -122,12 +122,39 @@ final class TranscriptionDelivery {
         SoundManager.shared.playStopSound()
         await actions.dismiss()
 
+        // A custom command delivers text just like a paste does, so it has to honor
+        // auto-send the same way. Without this the global "Auto Enter after
+        // transcription" preference silently applies to paste output ONLY, and any mode
+        // routing through a command can never submit - the text lands and simply sits
+        // there. The command's own delivery mechanism is irrelevant here: whatever it
+        // did, the cursor ends up in the app the user is looking at, which is exactly
+        // where the paste path posts its key too.
+        let autoSendKey = Self.resolvedAutoSendKey(for: item.output)
+
         Task {
-            await runCustomCommand(command: command, commandText: commandText)
+            let delivered = await runCustomCommand(command: command, commandText: commandText)
+            // Never submit after a failed command: the text never arrived, so a Return
+            // would fire into whatever the user has focused with nothing in front of it.
+            guard delivered, autoSendKey.isEnabled else { return }
+            try? await Task.sleep(nanoseconds: UInt64(Self.autoSendDelaySeconds * 1_000_000_000))
+            CursorPaster.performAutoSend(autoSendKey)
         }
     }
 
-    private func runCustomCommand(command: String, commandText: String) async {
+    /// The auto-send key to use after text has been delivered: the mode's own choice
+    /// wins, and the app-wide "Auto Enter after transcription" preference is the
+    /// fallback when the mode leaves it at none.
+    private static func resolvedAutoSendKey(for output: OutputRuntimeConfiguration) -> AutoSendKey {
+        if output.autoSendKey != .none { return output.autoSendKey }
+        return UserDefaults.standard.bool(forKey: "AutoEnterAfterTranscription") ? .enter : .none
+    }
+
+    /// Gap between text landing and the submit key. Long enough for terminal emulators,
+    /// which needed more than the original 100ms.
+    private static let autoSendDelaySeconds: Double = 0.5
+
+    @discardableResult
+    private func runCustomCommand(command: String, commandText: String) async -> Bool {
         let startTime = Date()
         logger.notice("Custom command started")
 
@@ -156,8 +183,10 @@ final class TranscriptionDelivery {
                     "Custom command succeeded duration=\(Self.formattedDuration(duration), privacy: .public)s stdoutBytes=\(stdoutBytes, privacy: .public) stderrBytes=\(stderrBytes, privacy: .public)"
                 )
             }
+            return true
         } catch {
             notifyCustomCommandFailure(error, duration: Date().timeIntervalSince(startTime))
+            return false
         }
     }
 
