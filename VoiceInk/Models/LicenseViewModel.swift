@@ -29,11 +29,37 @@ class LicenseViewModel: ObservableObject {
     private let userDefaults = UserDefaults.standard
     private let licenseManager = LicenseManager.shared
 
+    /// Bundle name that puts a build into local mode without recompiling it: rename the app to
+    /// `VoiceInk-local.app` and it behaves exactly as a `LOCAL_BUILD` does for licensing.
+    ///
+    /// This is deliberate and deliberately documented, not an oversight. It exists so the fork's
+    /// owner can move one signed build between their own machines without rebuilding, and it is
+    /// stated in the README rather than hidden, because an undisclosed bypass would be the worse
+    /// version of the same thing. Anyone reading either the source or the README can see exactly
+    /// what it does.
+    ///
+    /// Understand the consequence before shipping a binary containing this: renaming a file in
+    /// Finder is not a technical barrier, so any published build with this compiled in can be put
+    /// into local mode by anyone who downloads it. It only belongs in a build whose distribution
+    /// is intended to allow that.
+    private static let localModeBundleName = "VoiceInk-local"
+
+    /// Whether the running app has been renamed into local mode. Reads the bundle's own name on
+    /// disk rather than `CFBundleName`, since renaming the .app in Finder changes the former and
+    /// leaves the latter untouched - the whole point is that no rebuild is involved.
+    static var isLocalModeByBundleName: Bool {
+        Bundle.main.bundleURL.deletingPathExtension().lastPathComponent == localModeBundleName
+    }
+
     init() {
         #if LOCAL_BUILD
             licenseState = .licensed
         #else
-            loadLicenseState()
+            if Self.isLocalModeByBundleName {
+                licenseState = .licensed
+            } else {
+                loadLicenseState()
+            }
         #endif
     }
 

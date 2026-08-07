@@ -237,7 +237,10 @@ struct VoiceInkApp: App {
         )
 
         let dictionarySchema = Schema([VocabularyWord.self, WordReplacement.self])
-        #if LOCAL_BUILD
+        // FORK_BUILD is distinct from LOCAL_BUILD: it does not bypass licensing, it only
+        // swaps out infrastructure/identity that upstream's iCloud container can't grant
+        // to a fork's Developer ID team (no provisioning profile, no CloudKit container access).
+        #if LOCAL_BUILD || FORK_BUILD
             let dictionaryCloudKit: ModelConfiguration.CloudKitDatabase = .none
         #else
             let dictionaryCloudKit: ModelConfiguration.CloudKitDatabase = .private(

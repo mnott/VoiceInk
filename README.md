@@ -20,33 +20,19 @@
 
 ---
 
-> **Fork Notice** - This is a personal fork of [Beingpax/VoiceInk](https://github.com/Beingpax/VoiceInk), currently rebased on upstream **v2.1**.
+> **Fork Notice** - This is a personal fork of [Beingpax/VoiceInk](https://github.com/Beingpax/VoiceInk), currently rebased on upstream **v2.1**, released as **2.1.1**.
 >
 > ### Changes in this fork
 >
-> - **Auto Enter After Paste** - A global toggle (AI Models > Settings > Advanced) that presses Return after the transcribed text is pasted, in every app. Upstream only offers this per Mode via the *Auto Send Key* picker; this is the always-on fallback. A Mode that defines its own auto-send key keeps it — the global toggle only fills in when the Mode's key is *None*.
-> - **No update nag in local builds** - Sparkle cannot update an ad-hoc signed build, so `LOCAL_BUILD` turns off automatic update checks. Manual *Check for Updates…* still works.
-> - **LOCAL build badge** - An orange `LOCAL <version>` badge at the bottom of the sidebar so a self-built copy is never mistaken for an official release.
+> - **Pinned destination** - Pin whatever you can type into right now with a shortcut, and every later dictation lands there without stealing focus, so you can read and work elsewhere while dictating into it. Works with an iTerm2 pane addressed by its session id, or with a focused text field in any app. A pinned iTerm2 pane can be tinted (colour and opacity of your choosing) so you can tell at a glance which one it is; the original background colour is captured first and always put back.
+> - **Per-application delivery options** - Per-app control over what happens when dictated text arrives: switch the app into typing mode first, submit with Return afterwards, and whether to leave a trailing space so you can keep dictating. These apply to normal dictation as well as to a pinned destination, and an explicit per-app rule overrides the app-wide preferences.
 >
-> The licensing bypass is *not* part of this fork - it is upstream's own `LOCAL_BUILD` compilation flag, enabled by `make local`.
+> ![Pinned destination and delivery options in Settings](docs/images/pinned-destination-settings.png)
 >
-> ### Building
+> - **Auto Enter After Paste** - A global toggle (AI Models > Settings > Advanced) that presses Return after the transcribed text is pasted, in every app. Upstream only offers this per Mode via the *Auto Send Key* picker; this is the always-on fallback. A Mode that defines its own auto-send key keeps it — the global toggle only fills in when the Mode's key is *None*. Also fixes it being ignored entirely for Modes whose output is a Custom Command.
 >
-> ```shell
-> make local
-> ```
+> - **Dynamic Local Mode** - Rename the app to VoiceInk-local to test for local usage.
 >
-> This produces `~/Downloads/VoiceInk.app` with ad-hoc signing and the `LOCAL_BUILD` flag enabled. See [BUILDING.md](BUILDING.md) for prerequisites (Xcode, whisper.cpp xcframework).
->
-> ### Staying in sync
->
-> Fork changes are kept as a thin set of commits on top of `upstream/main`, so a rebase is preferred over a merge. See **[UPGRADING.md](UPGRADING.md)** for the full runbook — including the TCC permission reset that is required whenever the installed app is replaced.
->
-> ```shell
-> git fetch upstream
-> git rebase upstream/main
-> make local
-> ```
 
 ---
 

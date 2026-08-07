@@ -18,8 +18,10 @@ WHISPER_FRAMEWORK="${VOICEINK_WHISPER_FRAMEWORK:-$HOME/VoiceInk-Dependencies/whi
 DEVELOPER_IDENTITY="${VOICEINK_DEVELOPER_IDENTITY:-Developer ID Application: Prakash Joshi (V6J6A3VWY2)}"
 NOTARY_PROFILE="${VOICEINK_NOTARY_PROFILE:-VoiceInk-Notarization}"
 SPARKLE_ACCOUNT="${VOICEINK_SPARKLE_ACCOUNT:-VoiceInk}"
-RELEASE_BASE_URL="${VOICEINK_RELEASE_BASE_URL:-https://github.com/Beingpax/VoiceInk/releases/download}"
-EXPECTED_FEED_URL="https://beingpax.github.io/VoiceInk/appcast.xml"
+RELEASE_BASE_URL="${VOICEINK_RELEASE_BASE_URL:-https://github.com/mnott/VoiceInk/releases/download}"
+# This guards against Info.plist accidentally reverting to upstream's feed (which would
+# offer users upstream's DMG as an "update" and silently replace this fork with the original).
+EXPECTED_FEED_URL="https://raw.githubusercontent.com/mnott/VoiceInk/main/appcast.xml"
 EXPECTED_BUNDLE_ID="com.prakashjoshipax.VoiceInk"
 EXPECTED_MINIMUM_SYSTEM_VERSION="14.4"
 
