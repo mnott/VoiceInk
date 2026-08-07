@@ -3,22 +3,20 @@
     <channel>
         <title>VoiceInk</title>
         <item>
-            <title>2.1.1</title>
-            <pubDate>Fri, 07 Aug 2026 22:51:50 +0200</pubDate>
-            <sparkle:version>211</sparkle:version>
-            <sparkle:shortVersionString>2.1.1</sparkle:shortVersionString>
+            <title>2.1.2</title>
+            <pubDate>Fri, 07 Aug 2026 23:15:52 +0200</pubDate>
+            <sparkle:version>212</sparkle:version>
+            <sparkle:shortVersionString>2.1.2</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.4</sparkle:minimumSystemVersion>
-            <description><![CDATA[<h3>What's New in VoiceInk 2.1.1</h3>
-<p>Dictation can now be aimed at a destination you choose, instead of always landing wherever the cursor happens to be.</p>
+            <description><![CDATA[<h3>What's New in VoiceInk 2.1.2</h3>
+<p>Settings backups now carry everything, so moving to another Mac no longer loses your setup.</p>
 <ul>
-  <li>📌 <strong>Pinned destination</strong> — Pin whatever you can type into with a shortcut, then keep dictating into it while you read and work somewhere else. Focus is never stolen. Works with an iTerm2 pane or a focused text field in any app.</li>
-  <li>🎨 <strong>Tint the pinned pane</strong> — Give a pinned iTerm2 pane a background colour of your choosing, with adjustable opacity, so you can tell at a glance which one is pinned. The original colour is captured first and always restored. The menu bar icon uses the same colour.</li>
-  <li>⚙️ <strong>Per-application delivery options</strong> — Decide per app what happens when dictated text arrives: switch the app into typing mode first, submit with Return afterwards, or leave a trailing space so you can keep dictating. These apply to ordinary dictation as well as to a pinned destination.</li>
-  <li>🐛 <strong>Auto Enter now works with Custom Command modes</strong> — The "Auto Enter after transcription" setting was silently ignored whenever a Mode's output was a Custom Command, so the text arrived and was never submitted.</li>
-  <li>⌨️ <strong>Global shortcuts no longer share the main thread</strong> — The keyboard event tap now runs on its own thread, so a busy app can no longer delay system-wide keyboard input.</li>
+  <li>💾 <strong>Export/Import covers the pinned-destination settings</strong> — Per-application delivery rules, the pin shortcut, and the tint colour and its on/off switch are now included in a settings backup. Previously they were silently dropped, so importing on a second machine left you to configure them again by hand.</li>
+  <li>💾 <strong>Two more settings included</strong> — "Auto Enter after transcription" and "Append trailing space" are backed up as well; neither was before.</li>
+  <li>🔒 <strong>Older backups still import</strong> — Every added field is optional, and a backup that predates them leaves those settings untouched rather than resetting them to defaults.</li>
 </ul>
 ]]></description>
-            <enclosure url="https://github.com/mnott/VoiceInk/releases/download/v2.1.1/VoiceInk.dmg" length="31218334" type="application/octet-stream" sparkle:edSignature="tiqTtic8KCHVL1qK+CWSFu7s9zbyxRCBPeYRhP4Df+wKV8ycK5AXSU13BTdMeJniDll+ZEV2domOkhuchVwsDQ=="/>
+            <enclosure url="https://github.com/mnott/VoiceInk/releases/download/v2.1.2/VoiceInk.dmg" length="31222686" type="application/octet-stream" sparkle:edSignature="p+1d6WP7Oo5RWR9e1gPjguP8JPeZbhFQbYsOt+KfMV4ticCXxb+dlCAmvgVlIuCN9lDQfK7IZURq4iNXAe7XDw=="/>
         </item>
     </channel>
 </rss>

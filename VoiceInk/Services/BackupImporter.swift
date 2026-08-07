@@ -204,11 +204,31 @@ enum BackupImporter {
         if let textFormattingEnabled = general.isTextFormattingEnabled {
             UserDefaults.standard.set(textFormattingEnabled, forKey: keyIsTextFormattingEnabled)
         }
+        if let autoEnter = general.autoEnterAfterTranscription {
+            UserDefaults.standard.set(autoEnter, forKey: "AutoEnterAfterTranscription")
+        }
+        if let appendSpace = general.appendTrailingSpace {
+            UserDefaults.standard.set(appendSpace, forKey: "AppendTrailingSpace")
+        }
         if let restoreClipboard = general.restoreClipboardAfterPaste {
             UserDefaults.standard.set(restoreClipboard, forKey: "restoreClipboardAfterPaste")
         }
         if let clipboardDelay = general.clipboardRestoreDelay {
             UserDefaults.standard.set(clipboardDelay, forKey: "clipboardRestoreDelay")
+        }
+
+        if let pinShortcut = general.pinDestinationShortcut {
+            ShortcutStore.setShortcut(pinShortcut.shortcut, for: .pinDestination)
+        }
+        if let enterRules = general.pinnedDestinationEnterRules {
+            PinnedDestinationEnterRuleStore.saveRules(enterRules)
+        }
+        if let highlightSession = general.highlightPinnedITermSession {
+            UserDefaults.standard.set(
+                highlightSession, forKey: PinnedDestinationSettingsKeys.highlightPinnedITermSession)
+        }
+        if let tintColorHex = general.pinnedITermTintColorHex {
+            UserDefaults.standard.set(tintColorHex, forKey: PinnedDestinationSettingsKeys.pinnedITermTintColorHex)
         }
 
         print("Successfully imported general settings.")

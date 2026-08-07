@@ -95,9 +95,21 @@ struct GeneralBackup: Codable {
     let isPauseMediaEnabled: Bool?
     let audioResumptionDelay: Double?
     let isTextFormattingEnabled: Bool?
+    let autoEnterAfterTranscription: Bool?
+    let appendTrailingSpace: Bool?
     let isExperimentalFeaturesEnabled: Bool?
     let restoreClipboardAfterPaste: Bool?
     let clipboardRestoreDelay: Double?
+
+    // Pinned destination, grouped together so the feature reads as one coherent block in
+    // the backup file rather than being scattered across it. `pinnedDestinationEnterRules`
+    // is exported as structured JSON (the type is already Codable) rather than as an opaque
+    // blob, on the theory that a backup a human can read - and edit, if something needs
+    // fixing by hand - is worth more than one they cannot.
+    let pinDestinationShortcut: ShortcutBackup?
+    let pinnedDestinationEnterRules: [PinnedDestinationEnterRule]?
+    let highlightPinnedITermSession: Bool?
+    let pinnedITermTintColorHex: String?
 }
 
 struct WordBackup: Codable {

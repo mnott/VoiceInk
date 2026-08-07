@@ -184,9 +184,21 @@ class ImportExportService {
             isPauseMediaEnabled: playbackController.isPauseMediaEnabled,
             audioResumptionDelay: mediaController.audioResumptionDelay,
             isTextFormattingEnabled: UserDefaults.standard.bool(forKey: keyIsTextFormattingEnabled),
+            autoEnterAfterTranscription: UserDefaults.standard.bool(forKey: "AutoEnterAfterTranscription"),
+            appendTrailingSpace: UserDefaults.standard.bool(forKey: "AppendTrailingSpace"),
             isExperimentalFeaturesEnabled: UserDefaults.standard.bool(forKey: "isExperimentalFeaturesEnabled"),
             restoreClipboardAfterPaste: UserDefaults.standard.bool(forKey: "restoreClipboardAfterPaste"),
-            clipboardRestoreDelay: UserDefaults.standard.double(forKey: "clipboardRestoreDelay")
+            clipboardRestoreDelay: UserDefaults.standard.double(forKey: "clipboardRestoreDelay"),
+
+            pinDestinationShortcut: ShortcutStore.shortcut(for: .pinDestination).map(ShortcutBackup.init),
+            pinnedDestinationEnterRules: {
+                let rules = PinnedDestinationEnterRuleStore.loadRules()
+                return rules.isEmpty ? nil : rules
+            }(),
+            highlightPinnedITermSession: UserDefaults.standard.bool(
+                forKey: PinnedDestinationSettingsKeys.highlightPinnedITermSession),
+            pinnedITermTintColorHex: UserDefaults.standard.string(
+                forKey: PinnedDestinationSettingsKeys.pinnedITermTintColorHex)
         )
 
         let exportedSettings = BackupFile(

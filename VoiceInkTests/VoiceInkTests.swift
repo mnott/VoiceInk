@@ -97,6 +97,26 @@ struct PinnedDestinationEnterRuleStoreRoundTripTests {
 
         #expect(PinnedDestinationEnterRuleStore.loadRules(from: defaults).isEmpty)
     }
+
+    @Test func rulesRoundTripWithAllThreeFlagsPreserved() throws {
+        // Settings export/import relies on this exact round-trip: it ships
+        // `PinnedDestinationEnterRule` as structured JSON rather than an opaque blob, so
+        // every one of its three independent flags - not just `appendReturn` - must survive
+        // encode/decode unchanged.
+        let rules = [
+            PinnedDestinationEnterRule(
+                bundleIdentifier: "com.googlecode.iterm2", appName: "iTerm2", appendReturn: true,
+                sendInsertPrefix: true, appendSpace: false)
+        ]
+
+        let data = try #require(PinnedDestinationEnterRuleStore.encode(rules))
+        let decoded = PinnedDestinationEnterRuleStore.decode(data)
+
+        #expect(decoded == rules)
+        #expect(decoded.first?.appendReturn == true)
+        #expect(decoded.first?.sendInsertPrefix == true)
+        #expect(decoded.first?.appendSpace == false)
+    }
 }
 
 // MARK: - Pinned Destination: toggle state machine
@@ -913,5 +933,80 @@ struct PinnedDestinationAXSubmissionDecisionTests {
         let decision = PinnedDestinationManager.decideAXSubmission(
             confirmActionSucceeded: false, keyEventPostSucceeded: false)
         #expect(decision == .notSubmitted)
+    }
+}
+
+// MARK: - Settings backup: pinned-destination fields and backward compatibility
+
+struct SettingsBackupPinnedDestinationFieldsTests {
+    @Test func generalBackupOmittingTheSixNewFieldsDecodesWithNilRatherThanThrowing() throws {
+        // The exact shape of a `GeneralBackup` payload written before pinned-destination
+        // settings, `AutoEnterAfterTranscription`, and `AppendTrailingSpace` were added to
+        // the export - none of the six new keys are present, not even as `null`. Every
+        // added property is Optional precisely so this throws nothing: a `keyNotFound`
+        // here would reject the user's whole settings backup, not just the new fields.
+        let oldFormatJSON = """
+            {
+                "isMiddleClickToggleEnabled": false,
+                "middleClickActivationDelay": 200,
+                "launchAtLoginEnabled": false,
+                "isMenuBarOnly": false,
+                "recorderType": "mini",
+                "appAppearancePreference": "system",
+                "appLanguagePreference": "system",
+                "isTranscriptionCleanupEnabled": false,
+                "transcriptionRetentionMinutes": 1440,
+                "isAudioCleanupEnabled": false,
+                "audioRetentionPeriod": 7,
+                "isSystemMuteEnabled": true,
+                "isPauseMediaEnabled": false,
+                "audioResumptionDelay": 0,
+                "isTextFormattingEnabled": true,
+                "isExperimentalFeaturesEnabled": false,
+                "restoreClipboardAfterPaste": true,
+                "clipboardRestoreDelay": 2
+            }
+            """
+        let data = try #require(oldFormatJSON.data(using: .utf8))
+        let decoded = try JSONDecoder().decode(GeneralBackup.self, from: data)
+
+        #expect(decoded.autoEnterAfterTranscription == nil)
+        #expect(decoded.appendTrailingSpace == nil)
+        #expect(decoded.pinDestinationShortcut == nil)
+        #expect(decoded.pinnedDestinationEnterRules == nil)
+        #expect(decoded.highlightPinnedITermSession == nil)
+        #expect(decoded.pinnedITermTintColorHex == nil)
+    }
+
+    @Test func newFieldsRoundTripThroughEncodeDecode() throws {
+        let rules = [
+            PinnedDestinationEnterRule(
+                bundleIdentifier: "com.googlecode.iterm2", appName: "iTerm2", appendReturn: true,
+                sendInsertPrefix: true, appendSpace: false)
+        ]
+        let general = GeneralBackup(
+            primaryRecordingShortcut: nil, secondaryRecordingShortcut: nil, pasteLastTranscriptionShortcut: nil,
+            pasteLastEnhancementShortcut: nil, retryLastTranscriptionShortcut: nil, cancelRecorderShortcut: nil,
+            openHistoryWindowShortcut: nil, quickAddToDictionaryShortcut: nil,
+            primaryRecordingShortcutRawValue: nil, secondaryRecordingShortcutRawValue: nil,
+            primaryRecordingShortcutModeRawValue: nil, secondaryRecordingShortcutModeRawValue: nil,
+            isMiddleClickToggleEnabled: nil, middleClickActivationDelay: nil, launchAtLoginEnabled: nil,
+            isMenuBarOnly: nil, recorderType: nil, appAppearancePreference: nil, appLanguagePreference: nil,
+            isTranscriptionCleanupEnabled: nil, transcriptionRetentionMinutes: nil, isAudioCleanupEnabled: nil,
+            audioRetentionPeriod: nil, isSystemMuteEnabled: nil, isPauseMediaEnabled: nil,
+            audioResumptionDelay: nil, isTextFormattingEnabled: nil, autoEnterAfterTranscription: true,
+            appendTrailingSpace: false, isExperimentalFeaturesEnabled: nil, restoreClipboardAfterPaste: nil,
+            clipboardRestoreDelay: nil, pinDestinationShortcut: nil, pinnedDestinationEnterRules: rules,
+            highlightPinnedITermSession: true, pinnedITermTintColorHex: "112233FF"
+        )
+
+        let data = try JSONEncoder().encode(general)
+        let decoded = try JSONDecoder().decode(GeneralBackup.self, from: data)
+
+        #expect(decoded.autoEnterAfterTranscription == true)
+        #expect(decoded.appendTrailingSpace == false)
+        #expect(decoded.highlightPinnedITermSession == true)
+        #expect(decoded.pinnedITermTintColorHex == "112233FF")
+        #expect(decoded.pinnedDestinationEnterRules == rules)
     }
 }

@@ -1,5 +1,24 @@
 # Lessons
 
+## A negative grep is not evidence of absence
+
+**What went wrong**: Twice in one session a defect was reported that did not exist.
+`strings` on a release binary did not contain a short string literal, which was read
+as "the feature is missing" — Swift stores strings of 15 bytes or fewer inline in
+code rather than in a literal section, so `strings` can never find them. Later, a
+grep for `sparkle:version="` found nothing and was reported as a missing attribute;
+it was present as an XML *element*, which is the correct modern syntax.
+
+**The rule**: Before reporting something absent, confirm the search could have found
+it if it were present. Prefer a check that fails loudly when the premise is wrong —
+comparing timestamps, parsing the file properly, or testing behaviour — over a grep
+whose silence has several possible meanings. A wrong "this is broken" costs more
+than the check would have.
+
+**Date**: 2026-08-07
+
+---
+
 ## Never suspend a process that holds a keyboard event tap
 
 **What went wrong**: lldb was attached to the running app to inspect its
