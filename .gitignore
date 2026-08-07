@@ -101,3 +101,7 @@ Network Trash Folder
 Temporary Items
 .apdisk default.profraw
 .local-build/
+
+# Release artefacts: built DMGs live here so they are findable next to the source,
+# but a 30 MB binary belongs on a release page, not in git history.
+build/

@@ -37,7 +37,11 @@ INPUT_APP=""
 INPUT_ARCHIVE=""
 NOTES_PATH=""
 RELEASE_TIMESTAMP="$(date '+%Y-%m-%d_%H-%M-%S')"
-RELEASE_OUTPUT_ROOT="${VOICEINK_RELEASE_OUTPUT_ROOT:-$HOME/Downloads/VoiceInk Builds}"
+# Inside the repo (and git-ignored) so a built DMG is findable next to the source that
+# produced it, rather than in a timestamped folder somewhere under Downloads. Still an
+# ignored directory, never a committed one: a 30 MB binary belongs on a release page, not
+# in git history.
+RELEASE_OUTPUT_ROOT="${VOICEINK_RELEASE_OUTPUT_ROOT:-$REPO_ROOT/build}"
 OUTPUT_DIR="$RELEASE_OUTPUT_ROOT/VoiceInk-$RELEASE_TIMESTAMP"
 APPCAST_OUTPUT="$REPO_ROOT/appcast.xml"
 SKIP_NOTARIZATION=0
