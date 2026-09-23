@@ -14,6 +14,13 @@ enum MeetingTurnTranscriber {
     ///     for the whole-meeting transcript's (`MeetingRecordingTranscriber`) first super-block;
     ///     later super-blocks seed from the ending floor this function returns.
     ///   - systemNoiseFloor: Same, for the system-audio channel.
+    ///   - systemDiarization: This chunk/super-block's diarized "Others" turns (see
+    ///     `MeetingDiarizer`/`MeetingDiarizationAttributor`), or `nil` when speaker identification
+    ///     isn't running this session - the pre-diarization behaviour, plain VAD on `system`
+    ///     labelled with the single generic "Others". When non-nil, only the portion of `system`
+    ///     the diarizer hasn't committed yet (`coveredThroughSample...`, normally at most a few
+    ///     seconds - streaming/offline latency) falls back to VAD, generically labelled; the rest
+    ///     is exactly the diarizer's own speaker segments.
     /// - Returns: The transcribed turns, plus the noise floor each channel ended on - so a caller
     ///   stitching several calls together over one file/session can seed the next one with it
     ///   instead of starting over at 0 (see
@@ -22,12 +29,15 @@ enum MeetingTurnTranscriber {
         mic: [Int16], system: [Int16],
         model: any TranscriptionModel, requestContext: TranscriptionRequestContext,
         serviceRegistry: TranscriptionServiceRegistry,
-        micNoiseFloor: Double = 0, systemNoiseFloor: Double = 0
+        micNoiseFloor: Double = 0, systemNoiseFloor: Double = 0,
+        systemDiarization: MeetingAudioCapture.SystemDiarization? = nil
     ) async -> (turns: [MeetingTurnTranscriptRenderer.TranscribedTurn], micNoiseFloor: Double, systemNoiseFloor: Double) {
         let (meRegions, endingMicNoiseFloor) = MeetingVAD.regionsAndEndingNoiseFloor(for: mic, startingNoiseFloor: micNoiseFloor)
-        let (othersRegions, endingSystemNoiseFloor) = MeetingVAD.regionsAndEndingNoiseFloor(for: system, startingNoiseFloor: systemNoiseFloor)
+        let (othersRegions, othersSpeakers, endingSystemNoiseFloor) = Self.othersRegionsAndSpeakers(
+            system: system, systemNoiseFloor: systemNoiseFloor, systemDiarization: systemDiarization)
         let turns = MeetingTurnBuilder.build(
-            meRegions: meRegions, othersRegions: othersRegions, meSamples: mic, othersSamples: system)
+            meRegions: meRegions, othersRegions: othersRegions, meSamples: mic, othersSamples: system,
+            othersSpeakers: othersSpeakers)
 
         var results: [MeetingTurnTranscriptRenderer.TranscribedTurn] = []
         // Serial, not concurrent: the local Whisper model is not safe to run two transcriptions
@@ -46,6 +56,36 @@ enum MeetingTurnTranscriber {
             results.append(.init(speaker: turn.speaker, text: filtered, start: turn.start, end: turn.end))
         }
         return (MeetingEchoSafetyNet.filter(results), endingMicNoiseFloor, endingSystemNoiseFloor)
+    }
+
+    /// Builds `MeetingTurnBuilder.build`'s `othersRegions`/`othersSpeakers` pair: purely diarized
+    /// when `systemDiarization` covers the whole buffer, a merge of the diarized regions plus a
+    /// VAD fallback over the not-yet-committed tail when it only covers part of it, or plain VAD
+    /// (the pre-diarization behaviour) when `systemDiarization` is `nil`.
+    private static func othersRegionsAndSpeakers(
+        system: [Int16], systemNoiseFloor: Double, systemDiarization: MeetingAudioCapture.SystemDiarization?
+    ) -> (regions: [MeetingVAD.Region], speakers: [MeetingTurnBuilder.Speaker]?, endingNoiseFloor: Double) {
+        guard let systemDiarization else {
+            let (regions, floor) = MeetingVAD.regionsAndEndingNoiseFloor(for: system, startingNoiseFloor: systemNoiseFloor)
+            return (regions, nil, floor)
+        }
+
+        var regions = systemDiarization.regions.map { MeetingVAD.Region(start: $0.start, end: $0.end) }
+        var speakers = systemDiarization.regions.map { MeetingTurnBuilder.Speaker.other($0.speaker) }
+
+        let coveredThrough = systemDiarization.coveredThroughSample
+        if coveredThrough < system.count {
+            let tail = Array(system[coveredThrough...])
+            let tailRegions = MeetingVAD.regions(for: tail, startingNoiseFloor: systemNoiseFloor)
+            for region in tailRegions {
+                regions.append(MeetingVAD.Region(start: region.start + coveredThrough, end: region.end + coveredThrough))
+                speakers.append(.others)
+            }
+        }
+        // Noise floor from a VAD-fallback tail (at most a few seconds) isn't worth threading
+        // through as the session's system noise floor - keep seeding future chunks from the value
+        // the caller already had.
+        return (regions, speakers, systemNoiseFloor)
     }
 
     private static func transcribedText(

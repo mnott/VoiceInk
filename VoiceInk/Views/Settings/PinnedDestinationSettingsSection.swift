@@ -17,6 +17,8 @@ struct PinnedDestinationSettingsSection: View {
         fromITermColor: PinnedDestinationManager.defaultPinnedBackgroundColor)
     @AppStorage(PinnedDestinationSettingsKeys.sendMeetingChunksAutomatically)
     private var sendMeetingChunksAutomatically = false
+    @AppStorage(PinnedDestinationSettingsKeys.identifyRemoteSpeakers)
+    private var identifyRemoteSpeakers = true
 
     @State private var meetingShortcutBindingCounts: [ShortcutAction: Int] = [
         .meetingCapture: ShortcutStore.shortcuts(for: .meetingCapture).count,
@@ -240,11 +242,18 @@ struct PinnedDestinationSettingsSection: View {
                     .help(
                         "While Meeting Capture is running, automatically send a chunk at a natural pause instead of waiting for the Send Meeting Chunk shortcut. The shortcut keeps working and resets the timing."
                     )
+
+                Toggle("Identify Remote Speakers", isOn: $identifyRemoteSpeakers)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .help(
+                        "Label each remote participant separately (\"Speaker 1\", \"Speaker 2\", ...) instead of one shared \"Others\" label, once the Nemotron 3 Diarization model is downloaded from the AI Models page. Uses extra CPU/Neural Engine time while a meeting is running."
+                    )
             } header: {
                 Text("Meeting Capture")
             } footer: {
                 Text(
-                    "Records the microphone and everything your Mac plays - the other participants in a Teams/Zoom call, for example - without muting or pausing the call. Each press of Send Meeting Chunk transcribes the audio captured since the last press and delivers it to the pinned destination (or the cursor) while recording keeps running. macOS asks once for System Audio Recording permission the first time you use this. Echo cancellation removes what the speakers played back out of the microphone recording, so the other participants are not captured twice even without headphones. Either action can have more than one shortcut - useful for pairing a keyboard combo with a mouse button combo."
+                    "Records the microphone and everything your Mac plays - the other participants in a Teams/Zoom call, for example - without muting or pausing the call. Each press of Send Meeting Chunk transcribes the audio captured since the last press and delivers it to the pinned destination (or the cursor) while recording keeps running. macOS asks once for System Audio Recording permission the first time you use this. Echo cancellation removes what the speakers played back out of the microphone recording, so the other participants are not captured twice even without headphones. Either action can have more than one shortcut - useful for pairing a keyboard combo with a mouse button combo. Download the Nemotron 3 Diarization model on the AI Models page to identify remote speakers individually instead of one shared \"Others\" label."
                 )
                 .font(.caption)
                 .foregroundColor(.secondary)

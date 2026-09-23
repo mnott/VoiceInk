@@ -266,6 +266,8 @@ struct ModelManagementView: View {
                 )
             }
 
+            MeetingDiarizationModelCardView(manager: MeetingDiarizationModelManager.shared)
+
             importLocalModelButton
 
             LocalEnhancementProviderManagementView()

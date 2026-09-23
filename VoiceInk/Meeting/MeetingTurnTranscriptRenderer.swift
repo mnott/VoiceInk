@@ -42,8 +42,15 @@ enum MeetingTurnTranscriptRenderer {
         }
 
         return paragraphs.map { paragraph -> String in
-            let label = paragraph.speaker == .me ? String(localized: "Me") : String(localized: "Others")
-            return "\(label): \(paragraph.texts.joined(separator: " "))"
+            "\(label(for: paragraph.speaker)): \(paragraph.texts.joined(separator: " "))"
         }.joined(separator: "\n\n")
+    }
+
+    private static func label(for speaker: MeetingTurnBuilder.Speaker) -> String {
+        switch speaker {
+        case .me: return String(localized: "Me")
+        case .other(nil): return String(localized: "Others")
+        case .other(let index?): return String(format: String(localized: "Speaker %d"), index + 1)
+        }
     }
 }

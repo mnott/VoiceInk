@@ -26,7 +26,7 @@ enum MeetingEchoSafetyNet {
     typealias TranscribedTurn = MeetingTurnTranscriptRenderer.TranscribedTurn
 
     static func filter(_ turns: [TranscribedTurn]) -> [TranscribedTurn] {
-        let othersTurns = turns.filter { $0.speaker == .others }
+        let othersTurns = turns.filter { $0.speaker.isOther }
         return turns.compactMap { turn in
             guard turn.speaker == .me else { return turn }
 

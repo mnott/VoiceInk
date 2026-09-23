@@ -38,6 +38,14 @@ enum PinnedDestinationSettingsKeys {
     /// default: silently auto-pasting into whatever is focused (or pinned) is not something to
     /// start doing without an explicit opt-in.
     static let sendMeetingChunksAutomatically = "SendMeetingChunksAutomatically"
+
+    /// Whether Meeting Capture uses Nemotron 3 diarization (see `MeetingDiarizer`) to split the
+    /// system-audio "Others" turns into individually labelled "Speaker N" turns. On by default:
+    /// unlike auto-send, this changes no delivered content or destination, only a label - it only
+    /// ever takes effect once the model is explicitly downloaded from the AI Models page (see
+    /// `MeetingDiarizationModelManager`), so there is no silent download or behavior change for
+    /// anyone who hasn't opted into that. Off falls back to the single generic "Others" label.
+    static let identifyRemoteSpeakers = "MeetingCaptureIdentifyRemoteSpeakers"
 }
 
 enum AppDefaults {
@@ -110,6 +118,7 @@ enum AppDefaults {
             // key is missing or unparseable, so both paths agree on "untouched" behavior.
             PinnedDestinationSettingsKeys.pinnedITermTintColorHex: PinnedDestinationManager.hexString(
                 fromITermColor: PinnedDestinationManager.defaultPinnedBackgroundColor),
+            PinnedDestinationSettingsKeys.identifyRemoteSpeakers: true,
 
             // UI & Behavior
             "IsMenuBarOnly": false,

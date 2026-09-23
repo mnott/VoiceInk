@@ -212,7 +212,8 @@ extension VoiceInkEngine {
                 mic: cut.mic, system: cut.system,
                 model: transcriptionConfiguration.model, requestContext: transcriptionConfiguration.requestContext,
                 serviceRegistry: serviceRegistry,
-                micNoiseFloor: cut.micNoiseFloor, systemNoiseFloor: cut.systemNoiseFloor)
+                micNoiseFloor: cut.micNoiseFloor, systemNoiseFloor: cut.systemNoiseFloor,
+                systemDiarization: cut.systemDiarization)
             combinedText = MeetingTurnTranscriptRenderer.render(result.turns)
         } else {
             let micText = await transcribedText(for: cut.mic, transcriptionConfiguration: transcriptionConfiguration)

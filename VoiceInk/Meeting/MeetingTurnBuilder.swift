@@ -8,9 +8,18 @@ import Foundation
 /// service-agnostic replacement for `MeetingAudioWindower`'s fixed 30 s windows, which could not
 /// tell that a short "Yes, I know" landed in the middle of the other side's sentence.
 enum MeetingTurnBuilder {
+    /// `other(nil)` is the generic, undiarized "Others" - either diarization is unavailable/failed
+    /// (see `MeetingDiarizer`), or a chunk's tail the diarizer hasn't committed yet. `other(i)` is
+    /// a diarized remote speaker slot (arrival-ordered, 0-based - "Speaker 1" is `other(0)`).
     enum Speaker: Equatable {
         case me
-        case others
+        case other(Int?)
+        static let others = Speaker.other(nil)
+
+        var isOther: Bool {
+            if case .other = self { return true }
+            return false
+        }
     }
 
     struct Turn: Equatable {
@@ -29,15 +38,24 @@ enum MeetingTurnBuilder {
     /// audio rather than the clip sent to the transcription service with synthetic silence).
     static let transcriptionPaddingSamples = Int(0.2 * sampleRate)
 
+    /// - Parameter othersSpeakers: Per-`othersRegions`-element speaker label, e.g. from
+    ///   `MeetingDiarizer` (`.other(0)`, `.other(1)`, ...). `nil` (the default) or a short array
+    ///   keeps every region labelled the generic `.others` - the pre-diarization behaviour.
     static func build(
         meRegions: [MeetingVAD.Region], othersRegions: [MeetingVAD.Region],
-        meSamples: [Int16], othersSamples: [Int16]
+        meSamples: [Int16], othersSamples: [Int16],
+        othersSpeakers: [Speaker]? = nil
     ) -> [Turn] {
         struct Placed {
             let speaker: Speaker
             let start: Int
             let end: Int
             let orderKey: Int
+        }
+
+        func othersSpeaker(at index: Int) -> Speaker {
+            guard let othersSpeakers, index < othersSpeakers.count else { return .others }
+            return othersSpeakers[index]
         }
 
         func isInterjection(_ region: MeetingVAD.Region, into hosts: [MeetingVAD.Region]) -> Bool {
@@ -50,8 +68,8 @@ enum MeetingTurnBuilder {
         var placed: [Placed] = []
 
         func placeHosts(
-            _ hosts: [MeetingVAD.Region], hostFlags: [Bool], hostSpeaker: Speaker, hostSamples: [Int16],
-            interjectors: [MeetingVAD.Region], interjectorFlags: [Bool], interjectorSpeaker: Speaker
+            _ hosts: [MeetingVAD.Region], hostFlags: [Bool], hostSpeaker: (Int) -> Speaker, hostSamples: [Int16],
+            interjectors: [MeetingVAD.Region], interjectorFlags: [Bool], interjectorSpeaker: (Int) -> Speaker
         ) {
             for (index, host) in hosts.enumerated() where !hostFlags[index] {
                 // ponytail: only the first eligible interjector per host is split out here; a
@@ -61,7 +79,7 @@ enum MeetingTurnBuilder {
                     interjectorFlags[$0] && host.start <= interjectors[$0].start && interjectors[$0].start < host.end
                 }
                 guard let interjectorIndex else {
-                    placed.append(Placed(speaker: hostSpeaker, start: host.start, end: host.end, orderKey: host.start))
+                    placed.append(Placed(speaker: hostSpeaker(index), start: host.start, end: host.end, orderKey: host.start))
                     continue
                 }
 
@@ -75,24 +93,28 @@ enum MeetingTurnBuilder {
                     .min { abs($0 - interjector.start) < abs($1 - interjector.start) }
 
                 if let splitPoint, splitPoint > host.start, splitPoint < host.end {
-                    placed.append(Placed(speaker: hostSpeaker, start: host.start, end: splitPoint, orderKey: host.start))
+                    placed.append(Placed(speaker: hostSpeaker(index), start: host.start, end: splitPoint, orderKey: host.start))
                     placed.append(
-                        Placed(speaker: interjectorSpeaker, start: interjector.start, end: interjector.end, orderKey: interjector.start))
-                    placed.append(Placed(speaker: hostSpeaker, start: splitPoint, end: host.end, orderKey: splitPoint))
+                        Placed(
+                            speaker: interjectorSpeaker(interjectorIndex), start: interjector.start, end: interjector.end,
+                            orderKey: interjector.start))
+                    placed.append(Placed(speaker: hostSpeaker(index), start: splitPoint, end: host.end, orderKey: splitPoint))
                 } else {
-                    placed.append(Placed(speaker: hostSpeaker, start: host.start, end: host.end, orderKey: host.start))
+                    placed.append(Placed(speaker: hostSpeaker(index), start: host.start, end: host.end, orderKey: host.start))
                     placed.append(
-                        Placed(speaker: interjectorSpeaker, start: interjector.start, end: interjector.end, orderKey: host.end))
+                        Placed(
+                            speaker: interjectorSpeaker(interjectorIndex), start: interjector.start, end: interjector.end,
+                            orderKey: host.end))
                 }
             }
         }
 
         placeHosts(
-            othersRegions, hostFlags: othersIsInterjection, hostSpeaker: .others, hostSamples: othersSamples,
-            interjectors: meRegions, interjectorFlags: meIsInterjection, interjectorSpeaker: .me)
+            othersRegions, hostFlags: othersIsInterjection, hostSpeaker: othersSpeaker, hostSamples: othersSamples,
+            interjectors: meRegions, interjectorFlags: meIsInterjection, interjectorSpeaker: { _ in .me })
         placeHosts(
-            meRegions, hostFlags: meIsInterjection, hostSpeaker: .me, hostSamples: meSamples,
-            interjectors: othersRegions, interjectorFlags: othersIsInterjection, interjectorSpeaker: .others)
+            meRegions, hostFlags: meIsInterjection, hostSpeaker: { _ in .me }, hostSamples: meSamples,
+            interjectors: othersRegions, interjectorFlags: othersIsInterjection, interjectorSpeaker: othersSpeaker)
 
         // Interjection-flagged regions never visited as a host above (its own host was itself an
         // interjection, or it lost out to another interjector in the same host) still need a turn.
@@ -102,9 +124,10 @@ enum MeetingTurnBuilder {
             placed.append(Placed(speaker: .me, start: region.start, end: region.end, orderKey: region.start))
         }
         for (index, region) in othersRegions.enumerated() where othersIsInterjection[index] {
-            let alreadyPlaced = placed.contains { $0.speaker == .others && $0.start == region.start && $0.end == region.end }
+            let speaker = othersSpeaker(at: index)
+            let alreadyPlaced = placed.contains { $0.speaker == speaker && $0.start == region.start && $0.end == region.end }
             guard !alreadyPlaced else { continue }
-            placed.append(Placed(speaker: .others, start: region.start, end: region.end, orderKey: region.start))
+            placed.append(Placed(speaker: speaker, start: region.start, end: region.end, orderKey: region.start))
         }
 
         let ordered = placed.sorted { $0.orderKey < $1.orderKey }.map { Turn(speaker: $0.speaker, start: $0.start, end: $0.end) }

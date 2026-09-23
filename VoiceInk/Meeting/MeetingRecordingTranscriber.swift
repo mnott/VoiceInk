@@ -30,6 +30,14 @@ enum MeetingRecordingTranscriber {
         guard let reader = MeetingRecordingWriter.ChannelReader(url: stereoURL) else { return "" }
         defer { reader.close() }
 
+        // One continuous offline-profile session for the whole recording (see `MeetingDiarizer`'s
+        // doc comment) - `nil` (silent fallback to the single "Others" label) unless the setting
+        // is on and the model is downloaded; never triggers a download itself.
+        let diarizer: MeetingDiarizer? =
+            UserDefaults.standard.bool(forKey: PinnedDestinationSettingsKeys.identifyRemoteSpeakers)
+            ? await MeetingDiarizer.makeIfAvailable(config: MeetingDiarizationModels.offlineConfig)
+            : nil
+
         var allTurns: [MeetingTurnTranscriptRenderer.TranscribedTurn] = []
         var micAcc: [Int16] = []
         var systemAcc: [Int16] = []
@@ -37,15 +45,26 @@ enum MeetingRecordingTranscriber {
         // starting over at 0, since only the very first one is guaranteed to start in genuine silence.
         var micNoiseFloor: Double = 0
         var systemNoiseFloor: Double = 0
+        var systemGlobalOffset = 0
 
         func flush() async {
             guard !micAcc.isEmpty else { return }
+
+            var diarization: MeetingAudioCapture.SystemDiarization? = nil
+            if let diarizer {
+                diarizer.append(systemAcc)
+                diarization = diarizer.attribute(
+                    chunkStartGlobal: systemGlobalOffset, chunkEndGlobal: systemGlobalOffset + systemAcc.count)
+            }
+
             let result = await MeetingTurnTranscriber.transcribe(
                 mic: micAcc, system: systemAcc, model: model, requestContext: requestContext,
-                serviceRegistry: serviceRegistry, micNoiseFloor: micNoiseFloor, systemNoiseFloor: systemNoiseFloor)
+                serviceRegistry: serviceRegistry, micNoiseFloor: micNoiseFloor, systemNoiseFloor: systemNoiseFloor,
+                systemDiarization: diarization)
             allTurns.append(contentsOf: result.turns)
             micNoiseFloor = result.micNoiseFloor
             systemNoiseFloor = result.systemNoiseFloor
+            systemGlobalOffset += systemAcc.count
             micAcc.removeAll()
             systemAcc.removeAll()
         }
@@ -59,6 +78,10 @@ enum MeetingRecordingTranscriber {
                 await flush()
             }
         }
+        // Flushes the diarizer's trailing partial chunk before the final super-block's flush()
+        // attributes it - the whole recording's last few seconds of "Others" speech would
+        // otherwise never be committed.
+        diarizer?.finish()
         await flush()
 
         return MeetingTurnTranscriptRenderer.render(allTurns)
