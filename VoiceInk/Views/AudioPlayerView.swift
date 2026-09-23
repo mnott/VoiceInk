@@ -342,6 +342,7 @@ private struct AsyncCircleButton: View {
 private enum OperationFeedback: Equatable {
     case retranscribeSuccess
     case reEnhanceSuccess
+    case identifySpeakersSuccess
 }
 
 // MARK: - AudioPlayerView
@@ -354,12 +355,16 @@ struct AudioPlayerView: View {
     @State private var isHovering = false
     @State private var isRetranscribing = false
     @State private var isReEnhancing = false
+    @State private var isIdentifyingSpeakers = false
+    @State private var unnamedSpeakerIDs: [String] = []
+    @State private var showIdentifySpeakersSheet = false
     @State private var operationFeedback: OperationFeedback?
     @State private var showModePopover = false
     @State private var showPromptPopover = false
     @EnvironmentObject private var engine: VoiceInkEngine
     @EnvironmentObject private var enhancementService: AIEnhancementService
     @ObservedObject private var modeManager = ModeManager.shared
+    @ObservedObject private var speakerLibrary = SpeakerLibraryStore.shared
     @Environment(\.modelContext) private var modelContext
 
     private var isOperationInProgress: Bool {
@@ -447,6 +452,17 @@ struct AudioPlayerView: View {
                     .disabled(isOperationInProgress)
                     .help("Retranscribe this audio")
 
+                    if transcription?.isMeetingRecording == true {
+                        AsyncCircleButton(
+                            defaultIcon: "person.wave.2",
+                            isLoading: isIdentifyingSpeakers,
+                            showSuccess: operationFeedback == .identifySpeakersSuccess,
+                            action: identifySpeakers
+                        )
+                        .disabled(isOperationInProgress || isIdentifyingSpeakers)
+                        .help("Identify Speakers")
+                    }
+
                     if transcription != nil {
                         AsyncCircleButton(
                             defaultIcon: "wand.and.stars",
@@ -483,6 +499,9 @@ struct AudioPlayerView: View {
         }
         .onDisappear {
             playerManager.cleanup()
+        }
+        .sheet(isPresented: $showIdentifySpeakersSheet) {
+            IdentifySpeakersSheet(unnamedIDs: unnamedSpeakerIDs, library: speakerLibrary)
         }
     }
 
@@ -629,6 +648,43 @@ struct AudioPlayerView: View {
         }
     }
 
+    /// (a) re-diarizes the record's system channel and extracts/matches fingerprints for any voice
+    /// that isn't identified yet (a no-op for voices that already are - see
+    /// `MeetingSpeakerIdentifier.assignSpeakers`'s no-op guard), (b) auto-names/merges voices the
+    /// library already recognises, then (c) shows `IdentifySpeakersSheet` for whatever is left
+    /// unnamed. Retranscribe already keeps ids across a full re-run (see
+    /// `AudioTranscriptionService.retranscribeMeetingAudio`'s `previousTurns` carry-forward) - this
+    /// button is for meetings that never had diarization/fingerprints computed at all, or for
+    /// naming voices a previous pass could only assign an id to.
+    private func identifySpeakers() {
+        guard let transcription, transcription.isMeetingRecording else { return }
+        let existingTurns = transcription.meetingTurns ?? []
+
+        isIdentifyingSpeakers = true
+        let meetingID = transcription.id
+        Task {
+            let systemChannel = (try? MeetingRecordingWriter.readChannels(from: url))?.system ?? []
+            let library = speakerLibrary
+            let updatedTurns = await MeetingSpeakerIdentifier.rediarizeAndAssignSpeakers(
+                turns: existingTurns, systemChannel: systemChannel, meetingID: meetingID, library: library)
+
+            await MainActor.run {
+                transcription.meetingTurns = updatedTurns
+                transcription.text = MeetingSpeakerTranscriptRenderer.render(updatedTurns) { library.name(for: $0) }
+                try? modelContext.save()
+
+                let unnamed = Set(updatedTurns.compactMap(\.speakerID)).filter { library.name(for: $0) == nil }
+                isIdentifyingSpeakers = false
+                if unnamed.isEmpty {
+                    showSuccessFeedback(.identifySpeakersSuccess, title: String(localized: "No new voices to identify"))
+                } else {
+                    unnamedSpeakerIDs = unnamed.sorted()
+                    showIdentifySpeakersSheet = true
+                }
+            }
+        }
+    }
+
     private func retranscribeAudio() {
         guard let selectedMode else {
             showErrorNotification(String(localized: "No mode selected"))
@@ -654,7 +710,7 @@ struct AudioPlayerView: View {
                 let result =
                     isMeetingRecording
                     ? try await transcriptionService.retranscribeMeetingAudio(
-                        from: url, using: transcriptionConfiguration.model)
+                        from: url, using: transcriptionConfiguration.model, previousTurns: transcription?.meetingTurns)
                     : try await transcriptionService.retranscribeAudio(
                         from: url,
                         using: transcriptionConfiguration.model,

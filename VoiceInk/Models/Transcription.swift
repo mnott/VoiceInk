@@ -34,6 +34,17 @@ final class Transcription {
     /// Capture session (left = "Me"/mic, right = "Others"/system in `audioFileURL`), rather than
     /// a normal dictation. Defaults to `false` so existing records need no migration.
     var isMeetingRecording: Bool = false
+    /// JSON-encoded `[MeetingTurnRecord]` for a meeting recording - `nil` for every non-meeting
+    /// record and for meeting records predating this field, both lightweight-migration safe the
+    /// same way `isMeetingRecording` is (a new `Optional` stored property with a default). `text`
+    /// is rendered from this via `MeetingSpeakerTranscriptRenderer`, not edited directly, once it
+    /// is present.
+    var meetingTurnsData: Data?
+
+    var meetingTurns: [MeetingTurnRecord]? {
+        get { meetingTurnsData.flatMap { try? JSONDecoder().decode([MeetingTurnRecord].self, from: $0) } }
+        set { meetingTurnsData = newValue.flatMap { try? JSONEncoder().encode($0) } }
+    }
 
     init(
         text: String,

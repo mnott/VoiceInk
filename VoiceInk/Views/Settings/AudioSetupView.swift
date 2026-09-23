@@ -31,6 +31,14 @@ struct AudioSetupView: View {
             }
 
             Section {
+                SpeakerLibrarySettingsView()
+            } header: {
+                Text("Speakers")
+            } footer: {
+                Text("Voices identified in Meeting Capture recordings via \"Identify Speakers\". Local only.")
+            }
+
+            Section {
                 Toggle("Mute Audio While Recording", isOn: $mediaController.isSystemMuteEnabled)
 
                 Toggle("Pause Media While Recording", isOn: $playbackController.isPauseMediaEnabled)

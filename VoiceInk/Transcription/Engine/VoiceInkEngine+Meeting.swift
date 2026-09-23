@@ -35,10 +35,11 @@ extension VoiceInkEngine {
                     isAutomatic: false)
             }
             let sessionRecordingURL = capture?.recordingURL
+            let sessionStartedAt = capture?.startedAt
             capture?.stop()
 
-            if let sessionRecordingURL {
-                enqueueMeetingRecordingTranscription(recordingURL: sessionRecordingURL)
+            if let sessionRecordingURL, let sessionStartedAt {
+                enqueueMeetingRecordingTranscription(recordingURL: sessionRecordingURL, startedAt: sessionStartedAt)
             }
 
             NotificationManager.shared.showNotification(
@@ -281,15 +282,15 @@ extension VoiceInkEngine {
 
     // MARK: - Whole-meeting History record (created once, at stop)
 
-    private func enqueueMeetingRecordingTranscription(recordingURL: URL) {
+    private func enqueueMeetingRecordingTranscription(recordingURL: URL, startedAt: Date) {
         let previousTask = meetingChunkTask
         meetingChunkTask = Task { [weak self] in
             await previousTask?.value
-            await self?.transcribeAndSaveMeetingRecording(recordingURL: recordingURL)
+            await self?.transcribeAndSaveMeetingRecording(recordingURL: recordingURL, startedAt: startedAt)
         }
     }
 
-    private func transcribeAndSaveMeetingRecording(recordingURL: URL) async {
+    private func transcribeAndSaveMeetingRecording(recordingURL: URL, startedAt: Date) async {
         guard
             let transcriptionConfiguration = ModeRuntimeResolver.transcriptionConfiguration(
                 transcriptionModelManager: transcriptionModelManager
@@ -303,32 +304,45 @@ extension VoiceInkEngine {
             return
         }
 
-        var text = await MeetingRecordingTranscriber.transcribe(
+        var turns = await MeetingRecordingTranscriber.transcribe(
             stereoURL: recordingURL,
             model: transcriptionConfiguration.model,
             requestContext: transcriptionConfiguration.requestContext,
             serviceRegistry: serviceRegistry
         )
-        text = WordReplacementService.shared.applyReplacements(to: text, using: modelContext)
+        for index in turns.indices {
+            turns[index].text = WordReplacementService.shared.applyReplacements(to: turns[index].text, using: modelContext)
+        }
 
         let duration = await AudioFileMetadata.duration(for: recordingURL)
+        let hasSpeech = turns.contains { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
-        if text.isEmpty {
+        if !hasSpeech {
             guard duration > Self.minimumMeaningfulMeetingDurationSeconds else {
                 try? FileManager.default.removeItem(at: recordingURL)
                 return
             }
-            text = String(localized: "(no speech detected)")
         }
 
+        let library = SpeakerLibraryStore.shared
         let transcription = Transcription(
-            text: text,
+            text: hasSpeech ? "" : String(localized: "(no speech detected)"),
             duration: duration,
             audioFileURL: recordingURL.absoluteString,
             transcriptionModelName: transcriptionConfiguration.model.displayName,
             transcriptionStatus: .completed,
             isMeetingRecording: true
         )
+        transcription.timestamp = startedAt
+
+        if hasSpeech {
+            let systemChannel = (try? MeetingRecordingWriter.readChannels(from: recordingURL))?.system ?? []
+            turns = await MeetingSpeakerIdentifier.assignSpeakers(
+                to: turns, systemChannel: systemChannel, meetingID: transcription.id, library: library)
+            transcription.meetingTurns = turns
+            transcription.text = MeetingSpeakerTranscriptRenderer.render(turns) { library.name(for: $0) }
+        }
+
         modelContext.insert(transcription)
         do {
             try modelContext.save()

@@ -21,13 +21,17 @@ enum MeetingRecordingTranscriber {
     // hangover, so a cut here can never land inside an in-progress region or interjection.
     private static let mutualSilenceTailFrames = Int(3 * sampleRate)
 
+    /// Transcribes the whole recording and returns its turns as meeting-global-sample-offset
+    /// `MeetingTurnRecord`s (diarized slot set where diarization ran, `speakerID` always `nil` -
+    /// see `MeetingSpeakerIdentifier` for that step). Callers render `text` themselves via
+    /// `MeetingSpeakerTranscriptRenderer` once speaker identification has run.
     static func transcribe(
         stereoURL: URL,
         model: any TranscriptionModel,
         requestContext: TranscriptionRequestContext,
         serviceRegistry: TranscriptionServiceRegistry
-    ) async -> String {
-        guard let reader = MeetingRecordingWriter.ChannelReader(url: stereoURL) else { return "" }
+    ) async -> [MeetingTurnRecord] {
+        guard let reader = MeetingRecordingWriter.ChannelReader(url: stereoURL) else { return [] }
         defer { reader.close() }
 
         // One continuous offline-profile session for the whole recording (see `MeetingDiarizer`'s
@@ -38,7 +42,7 @@ enum MeetingRecordingTranscriber {
             ? await MeetingDiarizer.makeIfAvailable(config: MeetingDiarizationModels.offlineConfig)
             : nil
 
-        var allTurns: [MeetingTurnTranscriptRenderer.TranscribedTurn] = []
+        var allTurns: [MeetingTurnRecord] = []
         var micAcc: [Int16] = []
         var systemAcc: [Int16] = []
         // 0 until the first super-block establishes it - later super-blocks seed from it instead of
@@ -61,7 +65,10 @@ enum MeetingRecordingTranscriber {
                 mic: micAcc, system: systemAcc, model: model, requestContext: requestContext,
                 serviceRegistry: serviceRegistry, micNoiseFloor: micNoiseFloor, systemNoiseFloor: systemNoiseFloor,
                 systemDiarization: diarization)
-            allTurns.append(contentsOf: result.turns)
+            // Mic and system are read in lockstep from the same stereo file, so one running offset
+            // (this super-block's start, in samples since the meeting began) applies to both
+            // channels' turns - see `MeetingTurnRecord.init(_:globalOffset:)`.
+            allTurns.append(contentsOf: result.turns.map { MeetingTurnRecord($0, globalOffset: systemGlobalOffset) })
             micNoiseFloor = result.micNoiseFloor
             systemNoiseFloor = result.systemNoiseFloor
             systemGlobalOffset += systemAcc.count
@@ -84,7 +91,7 @@ enum MeetingRecordingTranscriber {
         diarizer?.finish()
         await flush()
 
-        return MeetingTurnTranscriptRenderer.render(allTurns)
+        return allTurns
     }
 
     private static func bothChannelsSilentAtTail(mic: [Int16], system: [Int16]) -> Bool {

@@ -69,7 +69,7 @@ struct MeetingTurnBuilderDiarizedSpeakerTests {
         #expect(turns == [Turn(speaker: .others, start: 0, end: 1000)])
     }
 
-    @Test func rendererLabelsDiarizedSpeakersAsOneBasedSpeakerN() {
+    @Test func rendererLabelsDiarizedSpeakersWithEphemeralSpkIds() {
         typealias TranscribedTurn = MeetingTurnTranscriptRenderer.TranscribedTurn
         let rendered = MeetingTurnTranscriptRenderer.render([
             TranscribedTurn(speaker: .other(0), text: "hello"),
@@ -77,7 +77,9 @@ struct MeetingTurnBuilderDiarizedSpeakerTests {
             TranscribedTurn(speaker: .other(1), text: "hey there"),
             TranscribedTurn(speaker: .others, text: "unlabelled fallback"),
         ])
-        #expect(rendered == "Speaker 1: hello\n\nMe: hi\n\nSpeaker 2: hey there\n\nOthers: unlabelled fallback")
+        #expect(
+            rendered
+                == "[spk-0000:] hello\n\n[Me:] hi\n\n[spk-0001:] hey there\n\n[Others:] unlabelled fallback")
     }
 }
 

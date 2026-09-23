@@ -48,8 +48,8 @@ class AudioTranscriptionService: ObservableObject {
     /// (`MeetingRecordingTranscriber`), instead of downmixing it like a normal recording. AI
     /// enhancement is not applied - like the original meeting record, this is a diarized
     /// transcript, not free text a prompt should rewrite.
-    func retranscribeMeetingAudio(from url: URL, using model: any TranscriptionModel) async throws
-        -> AudioRetranscriptionResult
+    func retranscribeMeetingAudio(from url: URL, using model: any TranscriptionModel, previousTurns: [MeetingTurnRecord]? = nil)
+        async throws -> AudioRetranscriptionResult
     {
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw TranscriptionError.noAudioFile
@@ -58,13 +58,18 @@ class AudioTranscriptionService: ObservableObject {
         await MainActor.run { isTranscribing = true }
 
         let requestContext = TranscriptionRequestContext.currentDefaults.scoped(to: model)
-        var text = await MeetingRecordingTranscriber.transcribe(
+        var turns = await MeetingRecordingTranscriber.transcribe(
             stereoURL: url,
             model: model,
             requestContext: requestContext,
             serviceRegistry: serviceRegistry
         )
-        text = WordReplacementService.shared.applyReplacements(to: text, using: modelContext)
+        for index in turns.indices {
+            turns[index].text = WordReplacementService.shared.applyReplacements(to: turns[index].text, using: modelContext)
+        }
+        if let previousTurns {
+            turns = MeetingSpeakerIdentifier.carryForwardSpeakerIDs(to: turns, from: previousTurns)
+        }
 
         let audioAsset = AVURLAsset(url: url)
         let duration = CMTimeGetSeconds(try await audioAsset.load(.duration))
@@ -81,18 +86,25 @@ class AudioTranscriptionService: ObservableObject {
             throw error
         }
 
-        if text.isEmpty {
-            text = String(localized: "(no speech detected)")
-        }
-
+        let hasSpeech = turns.contains { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         let newTranscription = Transcription(
-            text: text,
+            text: hasSpeech ? "" : String(localized: "(no speech detected)"),
             duration: duration,
             audioFileURL: permanentURL.absoluteString,
             transcriptionModelName: model.displayName,
             transcriptionStatus: .completed,
             isMeetingRecording: true
         )
+
+        if hasSpeech {
+            let library = SpeakerLibraryStore.shared
+            let systemChannel = (try? MeetingRecordingWriter.readChannels(from: url))?.system ?? []
+            turns = await MeetingSpeakerIdentifier.assignSpeakers(
+                to: turns, systemChannel: systemChannel, meetingID: newTranscription.id, library: library)
+            newTranscription.meetingTurns = turns
+            newTranscription.text = MeetingSpeakerTranscriptRenderer.render(turns) { library.name(for: $0) }
+        }
+
         modelContext.insert(newTranscription)
         do {
             try modelContext.save()

@@ -82,6 +82,10 @@ final class MeetingAudioCapture: @unchecked Sendable {
     /// Stereo 16 kHz WAV for the whole session (left = mic, right = system), written from `start()`
     /// to `stop()` so it can be (re-)transcribed as a full, speaker-labelled meeting later.
     let recordingURL: URL
+    /// When this capture session started - the meeting's real start time, for the History
+    /// record's `timestamp` (previously left at its `Transcription.init()` default, which is
+    /// wall-clock "when the record was created", i.e. the meeting's END).
+    let startedAt = Date()
     private var recordingWriter: MeetingRecordingWriter?
 
     // MARK: - System audio (Core Audio process tap)

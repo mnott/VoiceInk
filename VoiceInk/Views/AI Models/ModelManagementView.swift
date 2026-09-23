@@ -268,6 +268,8 @@ struct ModelManagementView: View {
 
             MeetingDiarizationModelCardView(manager: MeetingDiarizationModelManager.shared)
 
+            MeetingSpeakerEmbeddingModelCardView(manager: MeetingSpeakerEmbeddingModelManager.shared)
+
             importLocalModelButton
 
             LocalEnhancementProviderManagementView()

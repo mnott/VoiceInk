@@ -3,13 +3,22 @@ import Foundation
 /// Renders a `MeetingTurnBuilder`-ordered list of transcribed turns into speaker-labelled text,
 /// e.g.:
 ///
-///     Me: ...
-///     Others: ...
-///     Me: ...
+///     [Me:] ...
+///     [Others:] ...
+///     [Me:] ...
 ///
 /// The turns are already in the right order (`MeetingTurnBuilder` resolved interjections), so
 /// this only needs to drop empties and merge consecutive same-speaker turns into one paragraph -
 /// the same merge `MeetingTranscriptInterleaver` used to do from window start times.
+///
+/// A diarized `.other(index)` gets a `spk-XXXX` tag derived from its arrival-ordered index alone
+/// (ponytail: not matched against the persistent speaker library - that only happens for the
+/// whole-meeting note, built after capture stops; a live chunk is paste-only and never saved, so
+/// there is no History record to attach a library match to yet). It is therefore stable only
+/// within one capture session, and unrelated to any library `spk-` id of the same-looking speaker
+/// once the meeting note re-identifies them - upgrade path is `MeetingDiarizationAttributor`
+/// carrying a per-session salt through to here if live cross-session-looking ids become confusing
+/// in practice.
 enum MeetingTurnTranscriptRenderer {
     struct TranscribedTurn: Equatable {
         let speaker: MeetingTurnBuilder.Speaker
@@ -42,7 +51,7 @@ enum MeetingTurnTranscriptRenderer {
         }
 
         return paragraphs.map { paragraph -> String in
-            "\(label(for: paragraph.speaker)): \(paragraph.texts.joined(separator: " "))"
+            "[\(label(for: paragraph.speaker)):] \(paragraph.texts.joined(separator: " "))"
         }.joined(separator: "\n\n")
     }
 
@@ -50,7 +59,7 @@ enum MeetingTurnTranscriptRenderer {
         switch speaker {
         case .me: return String(localized: "Me")
         case .other(nil): return String(localized: "Others")
-        case .other(let index?): return String(format: String(localized: "Speaker %d"), index + 1)
+        case .other(let index?): return String(format: "spk-%04x", index)
         }
     }
 }

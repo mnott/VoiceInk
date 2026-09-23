@@ -9,7 +9,7 @@ struct MeetingTurnTranscriptRendererTests {
             TranscribedTurn(speaker: .me, text: "hello"),
             TranscribedTurn(speaker: .others, text: "hi back"),
         ])
-        #expect(text == "Me: hello\n\nOthers: hi back")
+        #expect(text == "[Me:] hello\n\n[Others:] hi back")
     }
 
     @Test func mergesConsecutiveSameSpeakerTurnsIntoOneParagraph() {
@@ -18,7 +18,7 @@ struct MeetingTurnTranscriptRendererTests {
             TranscribedTurn(speaker: .me, text: "two"),
             TranscribedTurn(speaker: .me, text: "three"),
         ])
-        #expect(text == "Me: one two three")
+        #expect(text == "[Me:] one two three")
     }
 
     @Test func doesNotMergeAcrossAnInterveningOtherSpeakerTurn() {
@@ -27,7 +27,7 @@ struct MeetingTurnTranscriptRendererTests {
             TranscribedTurn(speaker: .others, text: "interruption"),
             TranscribedTurn(speaker: .me, text: "two"),
         ])
-        #expect(text == "Me: one\n\nOthers: interruption\n\nMe: two")
+        #expect(text == "[Me:] one\n\n[Others:] interruption\n\n[Me:] two")
     }
 
     @Test func dropsEmptyOrWhitespaceOnlyTurns() {
@@ -36,7 +36,7 @@ struct MeetingTurnTranscriptRendererTests {
             TranscribedTurn(speaker: .others, text: "   "),
             TranscribedTurn(speaker: .me, text: "world"),
         ])
-        #expect(text == "Me: hello world")
+        #expect(text == "[Me:] hello world")
     }
 
     @Test func emptyInputProducesAnEmptyTranscript() {
