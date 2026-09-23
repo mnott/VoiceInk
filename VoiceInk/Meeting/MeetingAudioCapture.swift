@@ -23,13 +23,20 @@ final class MeetingAudioCapture: @unchecked Sendable {
     // ponytail: chunkPending side grows unbounded between cut() calls - fine for meeting-length
     // gaps between hotkey presses, cap it if chunks are ever left uncut for very long stretches.
     private let drainBuffer = OSAllocatedUnfairLock<MeetingDrainBuffer>(initialState: MeetingDrainBuffer())
+    // Set (from the main actor) whenever a normal dictation recording starts/stops, read on
+    // `tapQueue` in `absorbAndWrite` - see `MeetingDictationGate`.
+    private let dictationActiveLock = OSAllocatedUnfairLock<Bool>(initialState: false)
+    var isDictationActive: Bool {
+        get { dictationActiveLock.withLock { $0 } }
+        set { dictationActiveLock.withLock { $0 = newValue } }
+    }
     // All drain/cut work is serialized on this queue (the periodic timer already fires here) so
     // two drains can never interleave their echo cancellation or meeting-file writes. Frequent
     // enough (rather than, say, 30s) that the auto-send trigger (see `evaluateAutoSend`) can
-    // resolve a ~1.5s silence pause with that same granularity - draining more often is otherwise
+    // resolve a ~1.0s silence pause with that same granularity - draining more often is otherwise
     // free, per the docs on `drainTick` below.
     private var drainTimer: DispatchSourceTimer?
-    private static let drainIntervalSeconds: TimeInterval = 1
+    private static let drainIntervalSeconds: TimeInterval = 0.5
 
     // ~-50 dBFS at 16-bit: below this a track is silence. Used by the per-track silence skip in
     // `VoiceInkEngine+Meeting`'s Whisper delivery (a different job than auto-send's speech
@@ -218,14 +225,22 @@ final class MeetingAudioCapture: @unchecked Sendable {
         let cleanedMic: [Int16]
         let referenceForMix: [Int16]
         if let echoCanceller, isCapturingSystemAudio {
+            // Pass the raw, possibly unequal-length per-tick streams straight through - end-
+            // aligning them here would corrupt the echo canceller's reference (see
+            // `MeetingDrainBuffer.drainRaw`); `cancelEcho` itself carries any length mismatch
+            // forward instead and always returns an equal-length pair.
             (cleanedMic, referenceForMix) = echoCanceller.cancelEcho(mic: rawMic, reference: rawSystem)
         } else {
-            (cleanedMic, referenceForMix) = (rawMic, rawSystem)
+            // No echo cancellation running (no system audio), so nothing needs the raw streams
+            // kept separate by channel - end-align them here instead, so the mic-only case still
+            // keeps `chunkPendingMic`/`chunkPendingSystem` (and the recording writer) in lockstep.
+            (cleanedMic, referenceForMix) = Self.alignedEnds(mic: rawMic, system: rawSystem)
         }
         absorbAndWrite(mic: cleanedMic, system: referenceForMix)
     }
 
     private func absorbAndWrite(mic: [Int16], system: [Int16]) {
+        let mic = MeetingDictationGate.silenceMicDuringDictation(mic, isDictationActive: isDictationActive)
         drainBuffer.withLock { $0.absorb(mic: mic, system: system) }
         do {
             try recordingWriter?.append(mic: mic, system: system)

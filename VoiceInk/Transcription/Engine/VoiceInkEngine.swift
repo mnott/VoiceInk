@@ -92,7 +92,25 @@ class VoiceInkEngine: NSObject, ObservableObject {
         }
     }
 
-    @Published var recordingState: RecordingState = .idle
+    /// Whether `state` is part of a normal (non-meeting) dictation recording's mic-relevant span -
+    /// from the moment it starts capturing through the end of transcribing that same audio - used
+    /// to gate Meeting Capture's mic channel (see `MeetingDictationGate`) so a private dictation to
+    /// the AI is never picked up a second time as a meeting chunk. `.enhancing`/`.busy` are
+    /// excluded: by then the recording has already been fully transcribed to text and the mic is no
+    /// longer involved.
+    static func isDictationRecordingState(_ state: RecordingState) -> Bool {
+        switch state {
+        case .starting, .recording, .transcribing: return true
+        case .idle, .enhancing, .busy: return false
+        }
+    }
+
+    // `didSet` (not scattered calls at each of the many places below that set this) so a
+    // concurrently running Meeting Capture always reflects the true current state, including every
+    // early-exit-to-`.idle` failure path - see `MeetingDictationGate`.
+    @Published var recordingState: RecordingState = .idle {
+        didSet { meetingCapture?.isDictationActive = Self.isDictationRecordingState(recordingState) }
+    }
     @Published var shouldCancelRecording = false
     @Published var partialTranscript: String = ""
     var currentSession: TranscriptionSession?
@@ -124,6 +142,21 @@ class VoiceInkEngine: NSObject, ObservableObject {
     @Published var isMeetingCaptureActive = false
     var meetingCapture: MeetingAudioCapture?
     var meetingChunkTask: Task<Void, Never>?
+    /// Holds/merges a meeting chunk's delivery while the user is typing into the destination -
+    /// see `VoiceInkEngine+Meeting.deliverMeetingChunkText` and `MeetingChunkDeliveryGuard`.
+    lazy var meetingChunkDeliveryCoordinator = MeetingChunkDeliveryCoordinator<MeetingChunkPayload>(
+        deliver: { [weak self] text, payload in
+            await self?.deliverMeetingChunkText(text, payload: payload)
+        },
+        discard: { payload in
+            try? FileManager.default.removeItem(at: payload.audioURL)
+        }
+    )
+    /// Set from `RecordingShortcutManager` whenever the meeting-chunk or meeting-capture hotkey
+    /// fires, so `MeetingChunkDeliveryGuard` can exclude that keyDown from counting as typing.
+    func noteMeetingHotkeyPressed() {
+        meetingChunkDeliveryCoordinator.lastHotkeyPressTime = Date()
+    }
 
     let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "VoiceInkEngine")
 

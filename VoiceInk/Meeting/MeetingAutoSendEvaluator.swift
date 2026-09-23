@@ -34,7 +34,7 @@ enum MeetingAutoSendEvaluator {
         // Frame resolution, not tick booleans: a tick counted as "speech" whenever any speech
         // occurred in it (and MeetingVAD's ~500 ms hangover keeps a channel "in speech" briefly
         // after it actually stops) used to make a pause between paragraphs read as at most ~1 s of
-        // silence regardless of how long it really was, so the 1.5 s trailing-silence policy could
+        // silence regardless of how long it really was, so the 1.0 s trailing-silence policy could
         // only ever fire via the 60 s cap. `lastVoicedEnd` (the last frame whose energy actually
         // crossed the threshold) is unaffected by the hangover, so silence is the real time since
         // that frame ended. `max` over both channels: silence must have started on whichever

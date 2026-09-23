@@ -28,6 +28,14 @@ import Foundation
 /// One instance covers a whole meeting-capture session: the adaptive filter's convergence must
 /// carry across `cut()` calls, so callers create it once in `start()` and destroy it in `stop()`
 /// rather than making a fresh one per cut.
+///
+/// Residual risk not addressed here: the mic (USB device) and system-tap (built-in output) are
+/// separate Core Audio clock domains, not one aggregate device, so their sample counts can drift
+/// apart by a few ppm over a long session; `cancelEcho`'s remainder carries that drift without
+/// corrupting alignment (see below), but if it ever grows enough to walk the true echo delay
+/// outside the 250 ms filter tail, cancellation would degrade over the course of a call. No
+/// evidence of this in the reduction figures measured so far - add periodic cross-correlation
+/// resync only if a long session is shown to need it.
 final class EchoCanceller {
     static let frameSize: Int32 = 320 // 20 ms at 16 kHz - matches speex_echo_cancellation's per-call size
     static let filterLength: Int32 = 4000 // 250 ms echo tail at 16 kHz
@@ -54,21 +62,21 @@ final class EchoCanceller {
         speex_echo_state_destroy(echoState)
     }
 
-    /// Removes `reference`'s acoustic echo from `mic`. Both must already be sample-aligned on
-    /// their end (see `MeetingAudioCapture.alignedEnds`), and `reference` must be causally ahead
-    /// of its echo in `mic` - true of a Core Audio process tap, which sees audio before the
-    /// speaker plays it - which is the order the canceller's filter delay expects. Returns the
-    /// cleaned mic samples together with the reference samples for that exact same span; both
-    /// may be a little shorter than the input because a trailing partial frame is held back and
-    /// prefixed onto the next call instead of being dropped or zero-padded now.
+    /// Removes `reference`'s acoustic echo from `mic`. `reference` must be causally ahead of its
+    /// echo in `mic` - true of a Core Audio process tap, which sees audio before the speaker plays
+    /// it - which is the order the canceller's filter delay expects. `mic` and `reference` need
+    /// not be the same length on any given call - their hardware callbacks fire independently, so
+    /// a per-tick mismatch is normal - the shorter combined stream caps how many frames are
+    /// processed and the excess of either stays in that channel's own remainder for the next call,
+    /// same as a trailing partial frame; nothing is ever dropped or zero-padded mid-stream, so the
+    /// reference is never shifted relative to the mic. Returns the cleaned mic samples together
+    /// with the reference samples for that exact same span, always equal length even when the
+    /// inputs weren't.
     func cancelEcho(mic: [Int16], reference: [Int16]) -> (mic: [Int16], reference: [Int16]) {
         let combinedMic = micRemainder + mic
         let combinedReference = referenceRemainder + reference
         let frameSize = Int(Self.frameSize)
-        // `mic` and `reference` arrive equal length (both already end-aligned by the caller), and
-        // the remainders from the previous call are equal length too, so the combined streams stay
-        // equal length here.
-        let frameCount = combinedMic.count / frameSize
+        let frameCount = min(combinedMic.count, combinedReference.count) / frameSize
         let consumed = frameCount * frameSize
 
         var cleanedMic = [Int16](repeating: 0, count: consumed)
@@ -95,18 +103,20 @@ final class EchoCanceller {
         return (cleanedMic, referenceForOutput)
     }
 
-    /// Cancels and returns whatever partial frame `cancelEcho` is still holding back (always
-    /// shorter than `frameSize`, so it never fills a frame on its own), by zero-padding it up to
-    /// one full frame. Call once, after the last `cancelEcho` call of a session, so the last
-    /// fraction of a second of audio is never silently dropped when a session ends.
+    /// Cancels and returns whatever partial audio `cancelEcho` is still holding back, by
+    /// zero-padding each remainder up to one full frame (they may now differ in length - see
+    /// `cancelEcho` - so each is padded from its own tail rather than assuming they match). Call
+    /// once, after the last `cancelEcho` call of a session, so the last fraction of a second of
+    /// audio is never silently dropped when a session ends.
     func flush() -> (mic: [Int16], reference: [Int16]) {
-        guard !micRemainder.isEmpty else { return ([], []) }
+        guard !micRemainder.isEmpty || !referenceRemainder.isEmpty else { return ([], []) }
         let frameSize = Int(Self.frameSize)
-        let validCount = micRemainder.count
-        let padCount = frameSize - validCount
+        let micTail = Array(micRemainder.suffix(frameSize))
+        let referenceTail = Array(referenceRemainder.suffix(frameSize))
+        let validCount = max(micTail.count, referenceTail.count)
 
-        var micFrame = micRemainder + [Int16](repeating: 0, count: padCount)
-        var referenceFrame = referenceRemainder + [Int16](repeating: 0, count: padCount)
+        var micFrame = micTail + [Int16](repeating: 0, count: frameSize - micTail.count)
+        var referenceFrame = referenceTail + [Int16](repeating: 0, count: frameSize - referenceTail.count)
         var cleaned = [Int16](repeating: 0, count: frameSize)
         micFrame.withUnsafeMutableBufferPointer { micPtr in
             referenceFrame.withUnsafeMutableBufferPointer { refPtr in

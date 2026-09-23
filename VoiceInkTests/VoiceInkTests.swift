@@ -1140,7 +1140,7 @@ struct MeetingAutoSendPolicyTests {
     @Test func sendsOnceEnoughSpeechIsFollowedByTheRequiredPause() {
         #expect(
             MeetingAutoSendPolicy.shouldSend(
-                speechSecondsSinceLastChunk: 25, currentSilenceDuration: 1.5, secondsSinceLastChunk: 27) == true)
+                speechSecondsSinceLastChunk: 25, currentSilenceDuration: 1.0, secondsSinceLastChunk: 27) == true)
     }
 
     @Test func forcesASendAtTheMaximumWaitEvenWithoutAPause() {
@@ -1155,7 +1155,7 @@ struct MeetingAutoSendPolicyTests {
                 speechSecondsSinceLastChunk: 4.9, currentSilenceDuration: 5, secondsSinceLastChunk: 5) == false)
         #expect(
             MeetingAutoSendPolicy.shouldSend(
-                speechSecondsSinceLastChunk: 25, currentSilenceDuration: 1.49, secondsSinceLastChunk: 59.9) == false)
+                speechSecondsSinceLastChunk: 25, currentSilenceDuration: 0.99, secondsSinceLastChunk: 59.9) == false)
     }
 }
 
@@ -1213,11 +1213,13 @@ struct MeetingAutoSendEvaluatorFrameResolutionTests {
         }
     }
 
-    /// Feeds `micStream` through `MeetingAutoSendEvaluator.step` in 1 s ticks - the same interval
-    /// `MeetingAudioCapture`'s drain timer uses - against a silent system channel. Returns the
-    /// elapsed stream time (seconds) at which the first tick triggered, or nil if none did.
-    private static func firstTriggerTime(_ micStream: [Int16]) -> TimeInterval? {
-        let tickSamples = Int(sampleRate)
+    /// Feeds `micStream` through `MeetingAutoSendEvaluator.step` in `tickSeconds` ticks - 1 s by
+    /// default, matching the granularity used to prove silence is measured at frame resolution
+    /// regardless of tick size; 0.5 s matches `MeetingAudioCapture`'s actual drain timer - against
+    /// a silent system channel. Returns the elapsed stream time (seconds) at which the first tick
+    /// triggered, or nil if none did.
+    private static func firstTriggerTime(_ micStream: [Int16], tickSeconds: Double = 1) -> TimeInterval? {
+        let tickSamples = Int(tickSeconds * sampleRate)
         var micState = MeetingVAD.State.initial
         var systemState = MeetingVAD.State.initial
         var tracker = MeetingAutoSendTracker()
@@ -1239,7 +1241,7 @@ struct MeetingAutoSendEvaluatorFrameResolutionTests {
     }
 
     @Test func fiveSecondsOfSpeechFollowedByTheRequiredPauseTriggers() {
-        // 5 s of speech - right at the floor - followed by a pause past the 1.5 s requirement
+        // 5 s of speech - right at the floor - followed by a pause past the 1.0 s requirement
         // must trigger, and well before the 60 s cap.
         let stream = Self.tone(seconds: 5) + Self.silence(seconds: 2.5)
 
@@ -1265,17 +1267,33 @@ struct MeetingAutoSendEvaluatorFrameResolutionTests {
         #expect(time >= 60, "must not fire before the 60 s cap even though speech never reached the floor")
     }
 
-    @Test func oneSecondGapsBetweenBurstsNeverTrigger() {
-        // 25 cycles of 1 s speech + 1 s silence: 25 s of speech accumulates (past the 5 s floor)
-        // but no single gap ever reaches the 1.5 s trailing-silence requirement, and the whole
-        // stream stays under the 60 s cap - so this must never trigger.
+    @Test func eightHundredMsGapsBetweenBurstsNeverTriggerAtHalfSecondTicks() {
+        // 25 cycles of 1 s speech + 0.8 s silence, ticked at the real 0.5 s drain interval: 25 s
+        // of speech accumulates (past the 5 s floor) but no single intra-sentence gap ever
+        // reaches the 1.0 s trailing-silence requirement, and the whole stream stays under the
+        // 60 s cap - so this must never trigger.
         var stream: [Int16] = []
         for _ in 0..<25 {
-            stream += Self.tone(seconds: 1) + Self.silence(seconds: 1)
+            stream += Self.tone(seconds: 1) + Self.silence(seconds: 0.8)
         }
         #expect(stream.count < Int(60 * Self.sampleRate))
 
-        #expect(Self.firstTriggerTime(stream) == nil)
+        #expect(Self.firstTriggerTime(stream, tickSeconds: 0.5) == nil)
+    }
+
+    @Test func triggerLandsOneToOnePointFiveSecondsAfterSpeechEndAtHalfSecondTicks() {
+        // 5 s of speech (past the 5 s floor) followed by a long pause, ticked at the real 0.5 s
+        // drain interval: the 1.0 s trailing-silence requirement must fire on the first tick
+        // whose accumulated silence reaches it - between 1.0 s (the requirement itself) and
+        // 1.5 s (one 0.5 s tick of slack) after speech ends, never later and never via the 60 s cap.
+        let stream = Self.tone(seconds: 5) + Self.silence(seconds: 3)
+
+        guard let time = Self.firstTriggerTime(stream, tickSeconds: 0.5) else {
+            Issue.record("expected a trigger during the pause, got none")
+            return
+        }
+        #expect(time >= 6.0, "must not fire before 1.0 s of trailing silence (5 s speech + 1.0 s)")
+        #expect(time <= 6.5, "must fire within one 0.5 s tick of the 1.0 s requirement (fired at \(time)s)")
     }
 }
 

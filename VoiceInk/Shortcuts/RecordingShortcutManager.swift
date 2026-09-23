@@ -226,6 +226,13 @@ class RecordingShortcutManager: ObservableObject {
             onKeyDown: { [weak self] action, eventTime in
                 Task { @MainActor in
                     guard let self else { return }
+                    // Recorded on keyDown (not keyUp, where `.meetingChunk`/`.meetingCapture`
+                    // actually dispatch) so `MeetingChunkDeliveryGuard` can exclude this exact
+                    // physical keystroke from counting as the user typing elsewhere - see its
+                    // `hotkeyEchoWindowSeconds` doc comment.
+                    if action == .meetingChunk || action == .meetingCapture {
+                        self.engine.noteMeetingHotkeyPressed()
+                    }
                     guard let mode = self.recordingMode(for: action) else { return }
                     await self.shortcutModeHandler.handleKeyDown(
                         action: action,

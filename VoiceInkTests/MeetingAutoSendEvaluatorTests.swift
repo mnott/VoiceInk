@@ -68,10 +68,13 @@ struct MeetingAutoSendEvaluatorTests {
         // never-ending "speech" region for the rest of the session (the floor only moved on
         // frames already classified silent, so a channel that starts loud never adapted). That
         // pinned currentSilenceDuration at 0 forever, so a natural trailing-silence trigger
-        // (silence >= 1.5s) could never fire, and even the 60s hard-cap trigger deferred
+        // (silence >= 1.0s) could never fire, and even the 60s hard-cap trigger deferred
         // everything (cutBoundary held at the still-"open" start of the session), so no automatic
         // chunk was ever actually delivered.
-        var system: [Int16] = []
+        // A 1s leading silence gives the VAD's calibration (see `MeetingVAD.calibrate`) genuine
+        // ambience to calibrate the system channel's noise floor from - real capture always has at
+        // least a brief instant before speech starts.
+        var system: [Int16] = [Int16](repeating: 0, count: Int(Self.sampleRate))
         for _ in 0..<3 {
             system += Self.speechBurst(seconds: 20)
             system += [Int16](repeating: 0, count: Int(2.5 * Self.sampleRate))
@@ -92,9 +95,14 @@ struct MeetingAutoSendEvaluatorTests {
         // everything back into the pending buffer. `cut()` must still reset the pending flag and
         // tracker regardless, so a second, later, cleanly-closed utterance (with a real gap) can
         // go on to trigger normally instead of auto-send staying permanently disabled.
+        // A 1s leading silence gives the VAD's calibration (see `MeetingVAD.calibrate`) genuine
+        // ambience to calibrate the noise floor from - real capture always has at least a brief
+        // instant before speech starts; a synthetic tone at full volume from sample zero, with
+        // nothing quieter anywhere in the stream, is not a scenario calibration can resolve.
+        let leadIn = [Int16](repeating: 0, count: Int(Self.sampleRate))
         let openEndedRun = Self.speechBurst(seconds: 65)
         let laterUtteranceWithAGap = Self.speechBurst(seconds: 25) + [Int16](repeating: 0, count: Int(3 * Self.sampleRate))
-        let system = openEndedRun + laterUtteranceWithAGap
+        let system = leadIn + openEndedRun + laterUtteranceWithAGap
         let mic = [Int16](repeating: 0, count: system.count)
 
         let (triggerSilences, delivered) = run(mic: mic, system: system)

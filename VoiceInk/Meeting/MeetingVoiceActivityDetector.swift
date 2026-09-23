@@ -6,6 +6,17 @@ import Foundation
 /// `process(_:state:)` threads its state across calls so a long recording can be analyzed in
 /// bounded-memory blocks instead of loading the whole file at once; `finish(state:)` closes out
 /// any speech run still open at the end of the stream.
+///
+/// The noise floor never adapts while someone is speaking: a quiet syllable or a short gap between
+/// words used to pull the floor toward its own (low) energy on every single frame, which raised
+/// the threshold, which made the next quiet moment - or eventually a whole word - read as silence
+/// too, snowballing within about a second into losing the rest of the utterance. It now only moves
+/// during a confirmed (~1 s), already-non-speech silence run (see `confirmedSilenceFrames`) - never
+/// while `inSpeech`, and never during the 500 ms hangover or a short gap between words. Separately,
+/// a much slower, bounded nudge (see `stuckSpeechNoiseFloorAdaptRate`) lets a channel whose ambient
+/// level itself starts out above the not-yet-adapted threshold (steady mic noise/room hum, or a
+/// chunk that opens mid-utterance with nothing quieter in it at all) still converge, without ever
+/// pulling the floor up anywhere near genuine, sustained speech loudness.
 enum MeetingVAD {
     struct Region: Equatable {
         let start: Int
@@ -21,6 +32,9 @@ enum MeetingVAD {
         /// point, not at whatever frame happened to end the block it was detected in.
         var lastVoicedEnd = 0
         var framesSinceLastVoiced = 0
+        /// Consecutive non-speech, below-threshold frames seen since the last voiced frame or
+        /// hangover close - `noiseFloor` only adapts here once this reaches `confirmedSilenceFrames`.
+        var confirmedSilenceRunFrames = 0
         var globalSampleOffset = 0
         var leftoverSamples: [Int16] = []
 
@@ -37,6 +51,10 @@ enum MeetingVAD {
     static let absoluteFloor: Double = 150
     static let marginAboveNoiseFloor: Double = 200
     static let noiseFloorAdaptRate: Double = 0.05
+    // How long a non-speech, below-threshold run must last before it counts as confirmed silence
+    // the floor is allowed to adapt to - shorter than this and it's just a gap between words or
+    // the 500 ms hangover after a region closes, not real silence.
+    static let confirmedSilenceFrames = Int(1.0 / 0.02)
     // The floor above only moves on frames already classified silent - if a channel's ambient
     // level starts out above the not-yet-adapted threshold (e.g. steady mic noise/room hum, before
     // any real silence has been seen), every frame keeps reading as speech and the floor is stuck
@@ -66,6 +84,7 @@ enum MeetingVAD {
         let frameCount = combined.count / frameSamples
         let consumed = frameCount * frameSamples
         state.leftoverSamples = Array(combined[consumed...])
+        let processedEnd = state.globalSampleOffset + consumed
 
         var regions: [Region] = []
         var voicedSamples = 0
@@ -73,38 +92,9 @@ enum MeetingVAD {
             let frameStart = i * frameSamples
             let frame = combined[frameStart..<frameStart + frameSamples]
             let energy = rms(frame)
-            let absoluteStart = state.globalSampleOffset + frameStart
-            let absoluteEnd = absoluteStart + frameSamples
-            let threshold = max(absoluteFloor, state.noiseFloor + marginAboveNoiseFloor)
-
-            if energy >= threshold {
-                if !state.inSpeech {
-                    state.inSpeech = true
-                    state.speechStart = absoluteStart
-                }
-                state.lastVoicedEnd = absoluteEnd
-                state.framesSinceLastVoiced = 0
-                voicedSamples += frameSamples
-                // Nudged toward `absoluteFloor`, not the frame's own (possibly very loud) energy:
-                // this only needs to climb enough to unstick a channel whose ambient level sits
-                // just above the not-yet-adapted threshold, not all the way up to genuine speech
-                // loudness - otherwise a long, real, uninterrupted monologue would eventually catch
-                // its own noise floor up to itself and get spuriously reclassified as silence too.
-                let stuckAdaptTarget = min(energy, absoluteFloor)
-                state.noiseFloor = state.noiseFloor * (1 - stuckSpeechNoiseFloorAdaptRate) + stuckAdaptTarget * stuckSpeechNoiseFloorAdaptRate
-            } else {
-                state.noiseFloor = state.noiseFloor * (1 - noiseFloorAdaptRate) + energy * noiseFloorAdaptRate
-                if state.inSpeech {
-                    state.framesSinceLastVoiced += 1
-                    if state.framesSinceLastVoiced >= hangoverFrames {
-                        if let region = closedRegion(state: state, processedEnd: state.globalSampleOffset + consumed) {
-                            regions.append(region)
-                        }
-                        state.inSpeech = false
-                        state.framesSinceLastVoiced = 0
-                    }
-                }
-            }
+            classify(
+                &state, energy: energy, absoluteStart: state.globalSampleOffset + frameStart,
+                processedEnd: processedEnd, regions: &regions, voicedSamples: &voicedSamples)
         }
         state.globalSampleOffset += consumed
         return (regions, voicedSamples, state)
@@ -121,12 +111,65 @@ enum MeetingVAD {
     /// super-block of a longer recording) - `process` then `finish` in one call.
     /// - Parameter startingNoiseFloor: Seeds the adaptive noise floor instead of starting from 0 -
     ///   used when `samples` is the continuation of a chunk-hotkey cut (see
-    ///   `MeetingAudioCapture.MeetingCut`), so a chunk that opens mid-utterance (no leading silence
-    ///   of its own to (re-)adapt against) classifies its first frames against the same threshold
-    ///   the session had already converged on rather than a fresh, unrepresentative one.
+    ///   `MeetingAudioCapture.MeetingCut`) or a later super-block of a longer recording (see
+    ///   `MeetingRecordingTranscriber`), so a chunk/super-block that opens mid-utterance (no leading
+    ///   silence of its own to (re-)adapt against) classifies its first frames against the same
+    ///   threshold the session/file had already converged on rather than a fresh one.
     static func regions(for samples: [Int16], startingNoiseFloor: Double = 0) -> [Region] {
+        regionsAndEndingNoiseFloor(for: samples, startingNoiseFloor: startingNoiseFloor).regions
+    }
+
+    /// Same as `regions(for:startingNoiseFloor:)` but also returns the noise floor the channel
+    /// ended on, so a caller transcribing a long recording in several super-blocks
+    /// (`MeetingRecordingTranscriber`) can seed the next one with it instead of starting over at 0.
+    static func regionsAndEndingNoiseFloor(
+        for samples: [Int16], startingNoiseFloor: Double = 0
+    ) -> (regions: [Region], noiseFloor: Double) {
         let (closed, _, state) = process(samples, state: State(noiseFloor: startingNoiseFloor))
-        return closed + finish(state: state)
+        return (closed + finish(state: state), state.noiseFloor)
+    }
+
+    /// Classifies one frame against the current threshold, updating `state`, appending a closed
+    /// region to `regions` if this frame's hangover just closed one, and adding to `voicedSamples`
+    /// if this frame was voiced.
+    private static func classify(
+        _ state: inout State, energy: Double, absoluteStart: Int, processedEnd: Int,
+        regions: inout [Region], voicedSamples: inout Int
+    ) {
+        let threshold = max(absoluteFloor, state.noiseFloor + marginAboveNoiseFloor)
+
+        if energy >= threshold {
+            if !state.inSpeech {
+                state.inSpeech = true
+                state.speechStart = absoluteStart
+            }
+            state.lastVoicedEnd = absoluteStart + frameSamples
+            state.framesSinceLastVoiced = 0
+            state.confirmedSilenceRunFrames = 0
+            voicedSamples += frameSamples
+            // Nudged toward `absoluteFloor`, not the frame's own (possibly very loud) energy: this
+            // only needs to climb enough to unstick a channel whose ambient level sits just above
+            // the not-yet-adapted threshold, not all the way up to genuine speech loudness -
+            // otherwise a long, real, uninterrupted monologue would eventually catch its own noise
+            // floor up to itself and get spuriously reclassified as silence too.
+            let stuckAdaptTarget = min(energy, absoluteFloor)
+            state.noiseFloor = state.noiseFloor * (1 - stuckSpeechNoiseFloorAdaptRate) + stuckAdaptTarget * stuckSpeechNoiseFloorAdaptRate
+        } else if state.inSpeech {
+            state.framesSinceLastVoiced += 1
+            if state.framesSinceLastVoiced >= hangoverFrames {
+                if let region = closedRegion(state: state, processedEnd: processedEnd) {
+                    regions.append(region)
+                }
+                state.inSpeech = false
+                state.framesSinceLastVoiced = 0
+                state.confirmedSilenceRunFrames = 0
+            }
+        } else {
+            state.confirmedSilenceRunFrames += 1
+            if state.confirmedSilenceRunFrames >= confirmedSilenceFrames {
+                state.noiseFloor = state.noiseFloor * (1 - noiseFloorAdaptRate) + energy * noiseFloorAdaptRate
+            }
+        }
     }
 
     private static func closedRegion(state: State, processedEnd: Int) -> Region? {

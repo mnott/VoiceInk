@@ -33,13 +33,19 @@ enum MeetingRecordingTranscriber {
         var allTurns: [MeetingTurnTranscriptRenderer.TranscribedTurn] = []
         var micAcc: [Int16] = []
         var systemAcc: [Int16] = []
+        // 0 until the first super-block establishes it - later super-blocks seed from it instead of
+        // starting over at 0, since only the very first one is guaranteed to start in genuine silence.
+        var micNoiseFloor: Double = 0
+        var systemNoiseFloor: Double = 0
 
         func flush() async {
             guard !micAcc.isEmpty else { return }
-            let turns = await MeetingTurnTranscriber.transcribe(
+            let result = await MeetingTurnTranscriber.transcribe(
                 mic: micAcc, system: systemAcc, model: model, requestContext: requestContext,
-                serviceRegistry: serviceRegistry)
-            allTurns.append(contentsOf: turns)
+                serviceRegistry: serviceRegistry, micNoiseFloor: micNoiseFloor, systemNoiseFloor: systemNoiseFloor)
+            allTurns.append(contentsOf: result.turns)
+            micNoiseFloor = result.micNoiseFloor
+            systemNoiseFloor = result.systemNoiseFloor
             micAcc.removeAll()
             systemAcc.removeAll()
         }

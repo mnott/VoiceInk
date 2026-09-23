@@ -49,6 +49,9 @@ extension VoiceInkEngine {
                 }
             }
             capture.start()
+            // A dictation already in flight when a meeting capture starts mid-recording must
+            // still be excluded - `recordingState`'s `didSet` only fires on later transitions.
+            capture.isDictationActive = Self.isDictationRecordingState(recordingState)
             meetingCapture = capture
             isMeetingCaptureActive = true
 
@@ -113,13 +116,15 @@ extension VoiceInkEngine {
             return
         }
 
-        // Chained after the previous chunk's task so deliveries stay in order and the local
-        // Whisper model, which is not safe to run concurrently, only ever transcribes one
-        // meeting chunk (or the final meeting recording) at a time.
+        // Chained after the previous chunk's task so transcriptions stay in order and the local
+        // Whisper model, which is not safe to run concurrently, only ever transcribes one meeting
+        // chunk (or the final meeting recording) at a time. Delivery itself is NOT part of this
+        // chain (see `transcribeMeetingChunk` -> `meetingChunkDeliveryCoordinator.submit`), so a
+        // chunk held by the typing guard never blocks the next chunk's transcription.
         let previousTask = meetingChunkTask
         meetingChunkTask = Task { [weak self] in
             await previousTask?.value
-            await self?.transcribeAndDeliverMeetingChunk(cut: cut, isCapturingSystemAudio: isCapturingSystemAudio)
+            await self?.transcribeMeetingChunk(cut: cut, isCapturingSystemAudio: isCapturingSystemAudio)
         }
     }
 
@@ -148,14 +153,27 @@ extension VoiceInkEngine {
         }
     }
 
-    private func transcribeAndDeliverMeetingChunk(
+    /// One chunk's scratch audio file plus the transcription configuration it was transcribed
+    /// with, carried from `transcribeMeetingChunk` through `meetingChunkDeliveryCoordinator` to
+    /// `deliverMeetingChunkText` - see `MeetingChunkDeliveryCoordinator`'s `Payload` generic.
+    struct MeetingChunkPayload {
+        let audioURL: URL
+        let transcriptionConfiguration: TranscriptionRuntimeConfiguration
+    }
+
+    /// Transcribes one meeting chunk, then hands the rendered text off to
+    /// `meetingChunkDeliveryCoordinator`, which delivers it immediately or holds it (see
+    /// `MeetingChunkDeliveryGuard`) while the user is typing into the destination. Only this
+    /// transcription step is chained on `meetingChunkTask` - see `deliverMeetingChunk`'s doc
+    /// comment for why delivery itself is not.
+    private func transcribeMeetingChunk(
         cut: MeetingAudioCapture.MeetingCut, isCapturingSystemAudio: Bool
     ) async {
         // Scratch file only: a chunk is paste-only and never becomes a History record, so its
-        // audio has no reason to live in the (permanent) recordings directory - it is deleted
-        // once transcription is done with it.
+        // audio has no reason to live in the (permanent) recordings directory. Deleted once
+        // `deliverMeetingChunkText` is done with it - which may be after a hold, not necessarily
+        // right after this function returns, so it is NOT cleaned up here via `defer`.
         let audioURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).wav")
-        defer { try? FileManager.default.removeItem(at: audioURL) }
 
         do {
             try MeetingAudioCapture.writeWAV(cut.mix, to: audioURL)
@@ -169,6 +187,7 @@ extension VoiceInkEngine {
                 transcriptionModelManager: transcriptionModelManager
             )
         else {
+            try? FileManager.default.removeItem(at: audioURL)
             NotificationManager.shared.showNotification(
                 title: String(localized: "No transcription model is selected"),
                 type: .error,
@@ -181,22 +200,37 @@ extension VoiceInkEngine {
         // plain, unlabeled whole-track transcription they always had.
         let combinedText: String
         if isCapturingSystemAudio {
-            let turns = await MeetingTurnTranscriber.transcribe(
+            let result = await MeetingTurnTranscriber.transcribe(
                 mic: cut.mic, system: cut.system,
                 model: transcriptionConfiguration.model, requestContext: transcriptionConfiguration.requestContext,
                 serviceRegistry: serviceRegistry,
                 micNoiseFloor: cut.micNoiseFloor, systemNoiseFloor: cut.systemNoiseFloor)
-            combinedText = MeetingTurnTranscriptRenderer.render(turns)
+            combinedText = MeetingTurnTranscriptRenderer.render(result.turns)
         } else {
             let micText = await transcribedText(for: cut.mic, transcriptionConfiguration: transcriptionConfiguration)
             combinedText = MeetingTranscriptCombiner.combine(micText: micText, systemText: "", isCapturingSystemAudio: false)
         }
 
+        // `meetingChunkDeliveryCoordinator.submit` discards `audioURL` itself (via `discard`) when
+        // `combinedText` is empty - see its doc comment - so the two silent/failed tracks case
+        // (previously delivered as an empty `pretranscribedText`, a no-op) is handled there.
+        meetingChunkDeliveryCoordinator.submit(
+            text: combinedText,
+            payload: MeetingChunkPayload(audioURL: audioURL, transcriptionConfiguration: transcriptionConfiguration)
+        )
+    }
+
+    /// The delivery step `meetingChunkDeliveryCoordinator` calls once a chunk (or several merged
+    /// together, held while the user was typing) is clear to go out. `text` is already
+    /// transcribed and rendered - only formatting/word-replacement/enhancement/delivery runs here.
+    func deliverMeetingChunkText(_ text: String, payload: MeetingChunkPayload) async {
+        defer { try? FileManager.default.removeItem(at: payload.audioURL) }
+
         // Transient: never inserted into modelContext, never saved, never posted as a History
         // event - only `pipeline.run`'s filter/format/word-replacement/enhancement/delivery runs
         // on it. See `TranscriptionPipeline.run`'s `saveToHistory` doc comment.
         let transcription = makeRecordingTranscription(
-            for: audioURL,
+            for: payload.audioURL,
             text: "",
             duration: 0,
             transcriptionStatus: .pending
@@ -204,13 +238,13 @@ extension VoiceInkEngine {
 
         await pipeline.run(
             transcription: transcription,
-            audioURL: audioURL,
-            transcriptionConfiguration: transcriptionConfiguration,
+            audioURL: payload.audioURL,
+            transcriptionConfiguration: payload.transcriptionConfiguration,
             formattingConfiguration: {
                 ModeRuntimeResolver.transcriptionFormattingConfiguration()
             },
             session: nil,
-            pretranscribedText: combinedText,
+            pretranscribedText: text,
             enhancementConfiguration: { [weak self] in
                 guard let self,
                     let enhancementService = self.enhancementService,

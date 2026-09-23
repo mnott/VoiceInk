@@ -22,16 +22,20 @@ struct MeetingDrainBuffer {
         pendingSystem.append(contentsOf: samples)
     }
 
-    /// Pulls everything captured since the previous drain or cut and end-aligns the two tracks
-    /// (see `MeetingAudioCapture.alignedEnds`). The result is both queued for the next
-    /// chunk-hotkey cut and returned so the caller can feed it (after echo cancellation, which
-    /// this type knows nothing about) to the continuous meeting file.
+    /// Pulls everything captured since the previous drain or cut, exactly as appended - not
+    /// end-aligned. Mic and system hardware callbacks fire independently, so the two can come back
+    /// different lengths on any given tick; end-aligning them here (as this used to do) would
+    /// zero-pad the shorter one and shift it relative to the other by a varying amount every ~0.5s,
+    /// which is fatal to the echo canceller's reference alignment (see `EchoCanceller.cancelEcho`,
+    /// which now carries any such length mismatch as a same-channel remainder instead). The result
+    /// is both queued for the next chunk-hotkey cut and returned so the caller can feed it (after
+    /// echo cancellation, which this type knows nothing about) to the continuous meeting file.
     mutating func drainRaw() -> (mic: [Int16], system: [Int16]) {
         let mic = pendingMic
         let system = pendingSystem
         pendingMic.removeAll()
         pendingSystem.removeAll()
-        return MeetingAudioCapture.alignedEnds(mic: mic, system: system)
+        return (mic, system)
     }
 
     /// Queues a (typically echo-cancelled) drain result for the next chunk-hotkey cut.

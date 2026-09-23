@@ -226,6 +226,68 @@ struct EchoCancellerTests {
         #expect(mic.isEmpty)
         #expect(reference.isEmpty)
     }
+
+    // Splits `samples` into chunks whose sizes cycle around `nominal`, alternately `jitter` above
+    // and below it, mimicking two independently-clocked hardware callbacks that rarely deliver
+    // exactly the same count on a shared drain tick. Chunk sizes still sum to `samples.count`
+    // exactly (the jitter cancels out every pair of ticks), matching how a real capture never
+    // loses or gains samples overall - only how they're grouped into per-tick calls.
+    private static func jitteredChunks(_ samples: [Int16], nominal: Int, jitter: Int) -> [[Int16]] {
+        var chunks: [[Int16]] = []
+        var offset = 0
+        var tick = 0
+        while offset < samples.count {
+            let size = min(nominal + (tick % 2 == 0 ? jitter : -jitter), samples.count - offset)
+            chunks.append(Array(samples[offset..<offset + size]))
+            offset += size
+            tick += 1
+        }
+        return chunks
+    }
+
+    @Test func cancelEchoConvergesWhenMicAndReferenceArriveAsUnevenPerTickChunksInsteadOfEndAlignedOnes() {
+        // Regression test for the live-meeting echo leak: MeetingDrainBuffer used to end-align
+        // (zero-pad) each drain tick's mic/system samples to equal length before handing them to
+        // the echo canceller, corrupting the reference's time alignment on every tick. Feeding the
+        // canceller each channel's own uneven per-tick chunks directly (this test) must still
+        // converge close to the single-call baseline; feeding it the old end-aligned chunks must
+        // measurably not.
+        let farEnd = Self.farEndChirp()
+        let nearEnd = Self.nearEndSine()
+        let mic = Self.micSignal(farEnd: farEnd, nearEnd: nearEnd)
+        // 8000 samples (0.5 s at 16 kHz) nominal tick, matching MeetingAudioCapture's real drain
+        // interval; 37 samples (~2 ms) of jitter, comfortably less than one 320-sample frame so
+        // each tick's mismatch is realistic rather than exaggerated.
+        let micChunks = Self.jitteredChunks(mic, nominal: 8000, jitter: 37)
+        let refChunks = Self.jitteredChunks(farEnd, nominal: 8000, jitter: -37)
+
+        func run(endAlignEachTick: Bool) -> [Int16] {
+            let canceller = EchoCanceller()
+            var cleaned: [Int16] = []
+            for (micChunk, refChunk) in zip(micChunks, refChunks) {
+                let (m, r) =
+                    endAlignEachTick
+                    ? MeetingAudioCapture.alignedEnds(mic: micChunk, system: refChunk) : (micChunk, refChunk)
+                cleaned.append(contentsOf: canceller.cancelEcho(mic: m, reference: r).mic)
+            }
+            cleaned.append(contentsOf: canceller.flush().mic)
+            return cleaned
+        }
+
+        let fixedCleaned = run(endAlignEachTick: false)
+        let buggyCleaned = run(endAlignEachTick: true)
+
+        let echoOnlyWindow = 60_000..<64_000
+        let rawEchoDB = Self.rmsDB(mic[echoOnlyWindow])
+        let fixedReductionDB = rawEchoDB - Self.rmsDB(fixedCleaned[echoOnlyWindow])
+        let buggyReductionDB = rawEchoDB - Self.rmsDB(buggyCleaned[echoOnlyWindow])
+
+        #expect(fixedReductionDB >= 15, "fixed (uneven, un-aligned) reduction was \(fixedReductionDB) dB")
+        #expect(
+            buggyReductionDB < fixedReductionDB - 5,
+            "expected per-tick end-alignment to measurably hurt convergence: buggy=\(buggyReductionDB) dB fixed=\(fixedReductionDB) dB"
+        )
+    }
 }
 
 // MARK: - Meeting Capture: drain / chunk-pending buffering
@@ -246,14 +308,18 @@ struct MeetingDrainBufferTests {
         #expect(secondSystem.isEmpty)
     }
 
-    @Test func drainRawEndAlignsUnevenTracksJustLikeMeetingAudioCapture() {
+    @Test func drainRawReturnsUnevenTracksAsIsWithoutEndAligning() {
+        // Mic and system hardware callbacks fire independently, so a real drain tick routinely
+        // sees different sample counts on each side; end-aligning here (as this used to do) would
+        // zero-pad and shift the shorter one every ~0.5s, corrupting the echo canceller's
+        // reference downstream (see EchoCancellerTests.cancelEchoHandlesUnevenPerCallLengths...).
         var buffer = MeetingDrainBuffer()
         buffer.appendMic([1, 2, 3, 4, 5])
         buffer.appendSystem([10, 20])
 
         let (mic, system) = buffer.drainRaw()
         #expect(mic == [1, 2, 3, 4, 5])
-        #expect(system == [0, 0, 0, 10, 20])
+        #expect(system == [10, 20])
     }
 
     @Test func cutChunkPendingIsEmptyBeforeAnyDrainOrAbsorb() {
@@ -375,22 +441,33 @@ struct MeetingAudioCaptureChunkBoundaryTests {
         var micState = MeetingVAD.State.initial
         var systemState = MeetingVAD.State.initial
         var baseOffset = 0
+        // Mirrors `MeetingAudioCapture.chunkStartMicNoiseFloor`: the floor as of the start of each
+        // chunk's audio, handed to that chunk's (otherwise fresh) per-chunk VAD - see
+        // `MeetingVAD.regions(for:startingNoiseFloor:)`. A chunk that opens mid-utterance (like cut2
+        // below) has no leading silence of its own to calibrate against, so it must seed from this
+        // instead of calibrating fresh.
+        var chunkStartMicNoiseFloor = 0.0
 
         // Cut 1: lands mid-way through u2, which is still open (no trailing silence yet) - only
         // the already-closed s0+u1+s1 prefix should be released; all of u2 held back.
         absorb(s0 + u1 + s1 + Array(u2.prefix(16000)), into: &buffer, micState: &micState, systemState: &systemState)
+        let cut1NoiseFloor = chunkStartMicNoiseFloor
         let cut1 = cut(from: &buffer, micState: micState, systemState: systemState, baseOffset: &baseOffset)
+        chunkStartMicNoiseFloor = micState.noiseFloor
         #expect(cut1 == s0 + u1 + s1)
 
         // Cut 2: the rest of u2, then s2 (which closes it), then half of u3 (still open) - u2 must
         // now appear complete, exactly once, at the start of this chunk.
         absorb(Array(u2.suffix(16000)) + s2 + Array(u3.prefix(8000)), into: &buffer, micState: &micState, systemState: &systemState)
+        let cut2NoiseFloor = chunkStartMicNoiseFloor
         let cut2 = cut(from: &buffer, micState: micState, systemState: systemState, baseOffset: &baseOffset)
+        chunkStartMicNoiseFloor = micState.noiseFloor
         #expect(cut2 == u2 + s2)
 
         // Cut 3: session stop - the rest of u3, still open (no trailing silence at all), must be
         // flushed anyway rather than staying stuck in the buffer.
         absorb(Array(u3.suffix(8000)), into: &buffer, micState: &micState, systemState: &systemState)
+        let cut3NoiseFloor = chunkStartMicNoiseFloor
         let cut3 = cut(
             from: &buffer, micState: micState, systemState: systemState, baseOffset: &baseOffset, forceFullRelease: true)
         #expect(cut3 == u3)
@@ -400,14 +477,16 @@ struct MeetingAudioCaptureChunkBoundaryTests {
         #expect(cut1 + cut2 + cut3 == fullStream)
 
         // Each utterance appears exactly once, complete, when the per-chunk turn-builder analyzes
-        // that chunk in isolation (fresh VAD state, exactly as MeetingTurnTranscriber does).
-        #expect(MeetingVAD.regions(for: cut1).count == 1)
+        // that chunk in isolation, seeded from the session's floor exactly as MeetingTurnTranscriber
+        // does (see `chunkStartMicNoiseFloor` above) - never calibrating fresh, since a chunk like
+        // cut2 opens mid-utterance with nothing quieter in it at all to calibrate from.
+        #expect(MeetingVAD.regions(for: cut1, startingNoiseFloor: cut1NoiseFloor).count == 1)
 
-        let cut2Regions = MeetingVAD.regions(for: cut2)
+        let cut2Regions = MeetingVAD.regions(for: cut2, startingNoiseFloor: cut2NoiseFloor)
         #expect(cut2Regions.count == 1)
         #expect(cut2Regions[0].end - cut2Regions[0].start >= u2.count, "u2 must appear whole, not truncated")
 
-        let cut3Regions = MeetingVAD.regions(for: cut3)
+        let cut3Regions = MeetingVAD.regions(for: cut3, startingNoiseFloor: cut3NoiseFloor)
         #expect(cut3Regions.count == 1)
         #expect(cut3Regions[0].end - cut3Regions[0].start >= u3.count, "u3 must appear whole, not truncated")
     }

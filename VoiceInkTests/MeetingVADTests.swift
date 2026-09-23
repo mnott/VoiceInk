@@ -9,12 +9,32 @@ struct MeetingVADTests {
         [Int16](repeating: 0, count: Int(seconds * sampleRate))
     }
 
-    private static func tone(seconds: Double, amplitude: Int16 = 6000, frequency: Double = 400) -> [Int16] {
+    private static func tone(seconds: Double, amplitude: Int16 = 6000, frequency: Double = 400, phaseStart: Double = 0) -> [Int16] {
         let count = Int(seconds * sampleRate)
         return (0..<count).map { i in
-            let t = Double(i) / sampleRate
+            let t = (Double(i) + phaseStart) / sampleRate
             return Int16(clamping: Int((Double(amplitude) * sin(2 * Double.pi * frequency * t)).rounded()))
         }
+    }
+
+    /// Alternates `loudMs` at `amplitude` with `quietMs` at `amplitude * quietFraction` for
+    /// `totalSeconds` - realistic energy dips within one continuous utterance (louder voiced
+    /// syllables, quieter consonants/breaths between them), phase-continuous across the switch so
+    /// there's no artificial click at each boundary.
+    private static func alternatingUtterance(
+        totalSeconds: Double, loudMs: Double, quietMs: Double, amplitude: Int16, quietFraction: Double
+    ) -> [Int16] {
+        var out: [Int16] = []
+        var phase = 0.0
+        while Double(out.count) / sampleRate < totalSeconds {
+            let loud = tone(seconds: loudMs / 1000, amplitude: amplitude, phaseStart: phase)
+            phase += Double(loud.count)
+            out += loud
+            let quiet = tone(seconds: quietMs / 1000, amplitude: Int16(Double(amplitude) * quietFraction), phaseStart: phase)
+            phase += Double(quiet.count)
+            out += quiet
+        }
+        return out
     }
 
     @Test func silenceProducesNoRegions() {
@@ -118,27 +138,28 @@ struct MeetingVADTests {
         // Amplitude 300 -> RMS ~= 212: above absoluteFloor (150) and above the very first
         // threshold (max(150, 0 + margin) = 200), before the noise floor has ever had a chance to
         // adapt. Reproduces a channel whose ambient level (steady mic noise/room hum) starts out
-        // loud enough to read as speech from frame 1 - previously the noise floor only moved on
-        // frames already classified silent, so it stayed pinned at 0 and this tone read as one
-        // never-ending utterance for the rest of the session.
+        // loud enough to read as speech from frame 1 - the bounded `stuckSpeechNoiseFloorAdaptRate`
+        // nudge lets the floor catch up to this steady level within well under a second instead of
+        // staying pinned at 0 (which would read this tone as one never-ending utterance forever).
         let samples = Self.tone(seconds: 6, amplitude: 300)
         let (regions, _, state) = MeetingVAD.process(samples, state: .initial)
 
         // The floor takes a brief moment to catch up, so the very start of the tone is read as one
         // short (padded) region - but it must not stay open for the rest of the 6s buffer.
         #expect(regions.count == 1, "only the brief startup misread should close, not the whole buffer")
-        #expect(state.noiseFloor > 100, "the floor must climb toward absoluteFloor, not stay pinned at its initial value")
-        // Once the floor has caught up, the same steady level must stop reading as speech -
-        // otherwise `currentSilenceDuration`/`openRegionStart` would stay stuck on this channel
-        // for the rest of the session even though nothing new is actually being said.
+        #expect(state.noiseFloor > 100, "the floor must climb toward the tone's own level, not stay pinned at 0")
         #expect(!state.inSpeech, "a merely-stationary signal must eventually reclassify as silence")
     }
 
     @Test func aRealSustainedLoudUtteranceIsNeverMisreadAsSilenceNoMatterHowLongItRuns() {
-        // The fix above must not let a channel's own long, genuinely loud speech catch its noise
-        // floor up to itself: the slow "unstick" adaptation targets at most `absoluteFloor`, never
-        // the frame's actual (possibly very loud) energy, so this never happens no matter how long
-        // the utterance runs.
+        // The fix must not let a channel's own long, genuinely loud speech catch its noise floor up
+        // to itself: the slow "unstick" adaptation targets at most `absoluteFloor`, never the
+        // frame's actual (possibly very loud) energy, so this never happens no matter how long the
+        // utterance runs - and the confirmed-silence-gated adaptation never touches the floor at all
+        // while `inSpeech`, so no combination of quiet dips inside it can either. Zero lead-in
+        // silence at all (speech starting on the very first sample of the whole stream) is
+        // deliberate: this must hold even for a chunk that opens fresh mid-utterance, not just for
+        // a session with room to "warm up" first.
         let samples = Self.tone(seconds: 90, amplitude: 6000)
         let (regions, _, state) = MeetingVAD.process(samples, state: .initial)
 
@@ -156,5 +177,84 @@ struct MeetingVADTests {
         let finished = MeetingVAD.finish(state: state)
         #expect(finished.count == 1)
         #expect(finished[0].start == 13600)
+    }
+
+    // MARK: - Bug: noise floor drifting up during real speech drops the rest of the utterance
+
+    @Test func realisticEnergyDipsWithinOneUtteranceNeverFragmentOrTruncateIt() {
+        // Reproduces the reported bug directly: a continuous utterance with natural loud/quiet
+        // variation (louder syllables, quieter ones in between - never actual silence) used to have
+        // its noise floor dragged up by every quiet dip, within about a second reading the rest of
+        // the utterance as silence and truncating or fragmenting it. A floor that only adapts during
+        // confirmed (~1 s) non-speech silence - never while `inSpeech` - must read this as one
+        // continuous region covering the whole utterance instead.
+        let roomHum = Self.tone(seconds: 1.0, amplitude: 60, frequency: 50)
+        let utterance = Self.alternatingUtterance(
+            totalSeconds: 3.0, loudMs: 120, quietMs: 80, amplitude: 400, quietFraction: 0.35)
+        let samples = roomHum + utterance + Self.silence(seconds: 1.5)
+
+        let regions = MeetingVAD.regions(for: samples)
+
+        #expect(regions.count == 1, "the whole utterance must read as one continuous region, not fragments")
+        guard let region = regions.first else { return }
+        #expect(region.start <= roomHum.count, "must not truncate the start of the utterance")
+        #expect(
+            region.end >= roomHum.count + utterance.count - MeetingVAD.frameSamples,
+            "must not truncate the end of the utterance")
+    }
+
+    @Test func speechStartingWithinTheFirstSecondStillReadsAsOneContinuousUtterance() {
+        // Only 1 s of room hum precedes the speech - well under the ~1s it can take the bounded
+        // "unstick" nudge (see `MeetingVAD.stuckSpeechNoiseFloorAdaptRate`) to fully converge on a
+        // steady ambient level - so this also exercises speech starting before the floor has fully
+        // settled, not just after.
+        let roomHum = Self.tone(seconds: 1.0, amplitude: 60, frequency: 50)
+        let speech = Self.tone(seconds: 3.0, amplitude: 4000)
+        let samples = roomHum + speech + Self.silence(seconds: 1)
+
+        let regions = MeetingVAD.regions(for: samples)
+
+        #expect(regions.count == 1)
+        guard let region = regions.first else { return }
+        #expect(region.start <= roomHum.count)
+        #expect(region.end >= roomHum.count + speech.count - MeetingVAD.frameSamples)
+    }
+
+    @Test func autoSendEvaluatorSeesNoPauseInsideARealisticEnergyDipUtterance() {
+        // The same alternating utterance as above, driven through `MeetingAutoSendEvaluator.step`
+        // in 0.5 s ticks (as the real drain timer does) - `currentSilenceDuration` must stay near
+        // zero throughout, never long enough to look like a genuine pause mid-utterance.
+        let roomHum = Self.tone(seconds: 1.0, amplitude: 60, frequency: 50)
+        let utterance = Self.alternatingUtterance(
+            totalSeconds: 3.0, loudMs: 120, quietMs: 80, amplitude: 400, quietFraction: 0.35)
+        let mic = roomHum + utterance
+        let system = [Int16](repeating: 0, count: mic.count)
+
+        var micState = MeetingVAD.State.initial
+        var systemState = MeetingVAD.State.initial
+        var tracker = MeetingAutoSendTracker()
+        var maxSilenceDuringUtterance: TimeInterval = 0
+        let tickSamples = Int(0.5 * Self.sampleRate)
+        // Feeds the room hum through too, so the evaluator's VAD calibrates against genuine
+        // ambience exactly as it would in a real session - only the silence duration seen once the
+        // utterance itself has started is what this test cares about.
+        var i = 0
+        while i < mic.count {
+            let end = min(i + tickSamples, mic.count)
+            let result = MeetingAutoSendEvaluator.step(
+                mic: Array(mic[i..<end]), system: Array(system[i..<end]), sampleRate: Self.sampleRate,
+                autoSendEnabled: true, micVADState: micState, systemVADState: systemState, tracker: tracker)
+            micState = result.micVADState
+            systemState = result.systemVADState
+            tracker = result.tracker
+            if i >= roomHum.count {
+                maxSilenceDuringUtterance = max(maxSilenceDuringUtterance, tracker.currentSilenceDuration)
+            }
+            i = end
+        }
+
+        #expect(
+            maxSilenceDuringUtterance < MeetingAutoSendPolicy.requiredTrailingSilenceSeconds,
+            "no dip inside the utterance must look like a genuine trailing pause")
     }
 }
