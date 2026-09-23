@@ -75,10 +75,12 @@ enum MeetingVAD {
     }
 
     /// Processes one block of samples. Returns regions that closed (500 ms of trailing silence
-    /// seen) within this block, in sample coordinates spanning the whole stream, the number of
-    /// samples in this block whose frame was classified as voiced (for `MeetingAutoSendEvaluator`'s
-    /// frame-resolution speech-seconds accounting), plus the state to pass into the next call.
-    static func process(_ samples: [Int16], state: State) -> (regions: [Region], voicedSamples: Int, state: State) {
+    /// seen) within this block, in sample coordinates spanning the whole stream, how many samples
+    /// the currently-open (or just-extended) utterance span grew by in this block - from region
+    /// start to last voiced frame, so it includes the short gaps between words the hangover
+    /// bridges, not just voiced frames themselves (for `MeetingAutoSendEvaluator`'s speech-seconds
+    /// accounting) - plus the state to pass into the next call.
+    static func process(_ samples: [Int16], state: State) -> (regions: [Region], utteranceGrowthSamples: Int, state: State) {
         var state = state
         let combined = state.leftoverSamples + samples
         let frameCount = combined.count / frameSamples
@@ -87,17 +89,17 @@ enum MeetingVAD {
         let processedEnd = state.globalSampleOffset + consumed
 
         var regions: [Region] = []
-        var voicedSamples = 0
+        var utteranceGrowthSamples = 0
         for i in 0..<frameCount {
             let frameStart = i * frameSamples
             let frame = combined[frameStart..<frameStart + frameSamples]
             let energy = rms(frame)
             classify(
                 &state, energy: energy, absoluteStart: state.globalSampleOffset + frameStart,
-                processedEnd: processedEnd, regions: &regions, voicedSamples: &voicedSamples)
+                processedEnd: processedEnd, regions: &regions, utteranceGrowthSamples: &utteranceGrowthSamples)
         }
         state.globalSampleOffset += consumed
-        return (regions, voicedSamples, state)
+        return (regions, utteranceGrowthSamples, state)
     }
 
     /// Closes any speech run still open at end of stream (no trailing silence long enough to have
@@ -130,23 +132,29 @@ enum MeetingVAD {
     }
 
     /// Classifies one frame against the current threshold, updating `state`, appending a closed
-    /// region to `regions` if this frame's hangover just closed one, and adding to `voicedSamples`
-    /// if this frame was voiced.
+    /// region to `regions` if this frame's hangover just closed one, and adding to
+    /// `utteranceGrowthSamples` how far the open utterance's span (region start to last voiced
+    /// frame) advanced because of this frame - the jump from the previous last-voiced frame to
+    /// this one if the utterance was already open (bridging any gap between them), or just this
+    /// frame's own length if it is the first voiced frame of a new region.
     private static func classify(
         _ state: inout State, energy: Double, absoluteStart: Int, processedEnd: Int,
-        regions: inout [Region], voicedSamples: inout Int
+        regions: inout [Region], utteranceGrowthSamples: inout Int
     ) {
         let threshold = max(absoluteFloor, state.noiseFloor + marginAboveNoiseFloor)
 
         if energy >= threshold {
+            let newLastVoicedEnd = absoluteStart + frameSamples
             if !state.inSpeech {
                 state.inSpeech = true
                 state.speechStart = absoluteStart
+                utteranceGrowthSamples += frameSamples
+            } else {
+                utteranceGrowthSamples += newLastVoicedEnd - state.lastVoicedEnd
             }
-            state.lastVoicedEnd = absoluteStart + frameSamples
+            state.lastVoicedEnd = newLastVoicedEnd
             state.framesSinceLastVoiced = 0
             state.confirmedSilenceRunFrames = 0
-            voicedSamples += frameSamples
             // Nudged toward `absoluteFloor`, not the frame's own (possibly very loud) energy: this
             // only needs to climb enough to unstick a channel whose ambient level sits just above
             // the not-yet-adapted threshold, not all the way up to genuine speech loudness -

@@ -20,8 +20,8 @@ enum MeetingAutoSendEvaluator {
         mic: [Int16], system: [Int16], sampleRate: Double, autoSendEnabled: Bool,
         micVADState: MeetingVAD.State, systemVADState: MeetingVAD.State, tracker: MeetingAutoSendTracker
     ) -> StepResult {
-        let (micRegions, micVoicedSamples, newMicVADState) = MeetingVAD.process(mic, state: micVADState)
-        let (systemRegions, systemVoicedSamples, newSystemVADState) = MeetingVAD.process(system, state: systemVADState)
+        let (micRegions, micUtteranceGrowth, newMicVADState) = MeetingVAD.process(mic, state: micVADState)
+        let (systemRegions, systemUtteranceGrowth, newSystemVADState) = MeetingVAD.process(system, state: systemVADState)
         let isSpeech = !micRegions.isEmpty || !systemRegions.isEmpty || newMicVADState.inSpeech || newSystemVADState.inSpeech
 
         let tickDuration = Double(mic.count) / sampleRate
@@ -38,10 +38,13 @@ enum MeetingAutoSendEvaluator {
         // only ever fire via the 60 s cap. `lastVoicedEnd` (the last frame whose energy actually
         // crossed the threshold) is unaffected by the hangover, so silence is the real time since
         // that frame ended. `max` over both channels: silence must have started on whichever
-        // channel spoke most recently. Speech seconds likewise come from voiced-frame counts
-        // rather than whole ticks; `max` (not sum) of the two channels' voiced-sample counts so
-        // overlapping talk on both channels isn't double-counted.
-        let speechSecondsThisTick = Double(max(micVoicedSamples, systemVoicedSamples)) / sampleRate
+        // channel spoke most recently. Speech seconds are utterance-span growth (region start to
+        // last voiced frame), not a count of voiced frames: with some mics, most frames between
+        // syllables fall below the energy threshold even mid-word, which used to make the 5 s
+        // minimum practically unreachable - counting the whole span instead (including the short
+        // gaps the hangover bridges) reflects how long someone was actually talking. `max` (not
+        // sum) of the two channels' growth so overlapping talk on both channels isn't double-counted.
+        let speechSecondsThisTick = Double(max(micUtteranceGrowth, systemUtteranceGrowth)) / sampleRate
         let lastVoicedEnd = max(newMicVADState.lastVoicedEnd, newSystemVADState.lastVoicedEnd)
         let currentSilenceDuration = Double(newMicVADState.globalSampleOffset - lastVoicedEnd) / sampleRate
 

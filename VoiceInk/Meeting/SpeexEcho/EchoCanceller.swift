@@ -40,6 +40,14 @@ final class EchoCanceller {
     static let frameSize: Int32 = 320 // 20 ms at 16 kHz - matches speex_echo_cancellation's per-call size
     static let filterLength: Int32 = 4000 // 250 ms echo tail at 16 kHz
     static let sampleRate: Int32 = 16000
+    // How far behind the mic the reference is allowed to lag before it's treated as silence and
+    // zero-padded rather than starving the mic indefinitely. The Core Audio process tap delivers
+    // nothing while no audio is playing on the Mac, so without this bound `micRemainder` would
+    // grow forever and no mic audio would ever reach the meeting file. 200 ms comfortably fits
+    // inside `filterLength`'s 250 ms tail, so a reference that's merely running a tick or two
+    // behind (the normal case while it's actually delivering) is still combined for real, exact
+    // alignment rather than padded.
+    static let maxReferenceLagSamples = Int(sampleRate) / 5
 
     private let echoState: OpaquePointer
 
@@ -71,10 +79,17 @@ final class EchoCanceller {
     /// same as a trailing partial frame; nothing is ever dropped or zero-padded mid-stream, so the
     /// reference is never shifted relative to the mic. Returns the cleaned mic samples together
     /// with the reference samples for that exact same span, always equal length even when the
-    /// inputs weren't.
+    /// inputs weren't. If the reference is lagging the mic by more than `maxReferenceLagSamples`
+    /// (nothing playing, so the tap has delivered little or nothing), the gap beyond that bound is
+    /// treated as silence and zero-padded so the mic is never held back indefinitely; a reference
+    /// that's actually keeping up is combined exactly as before, with no padding at all.
     func cancelEcho(mic: [Int16], reference: [Int16]) -> (mic: [Int16], reference: [Int16]) {
         let combinedMic = micRemainder + mic
-        let combinedReference = referenceRemainder + reference
+        var combinedReference = referenceRemainder + reference
+        let requiredReferenceLength = max(0, combinedMic.count - Self.maxReferenceLagSamples)
+        if combinedReference.count < requiredReferenceLength {
+            combinedReference += [Int16](repeating: 0, count: requiredReferenceLength - combinedReference.count)
+        }
         let frameSize = Int(Self.frameSize)
         let frameCount = min(combinedMic.count, combinedReference.count) / frameSize
         let consumed = frameCount * frameSize
@@ -97,37 +112,47 @@ final class EchoCanceller {
             }
         }
 
-        micRemainder = Array(combinedMic[consumed...])
-        referenceRemainder = Array(combinedReference[consumed...])
+        // Safety net, not the normal path: `requiredReferenceLength` above already keeps the mic
+        // remainder within about one bound's worth of samples whenever the reference is silent, so
+        // this only bites in odd cases (e.g. a single very large tick) - it must never be what
+        // ordinarily bounds memory.
+        let remainderCap = Self.maxReferenceLagSamples + frameSize
+        micRemainder = Array(combinedMic[consumed...].suffix(remainderCap))
+        referenceRemainder = Array(combinedReference[consumed...].suffix(remainderCap))
         let referenceForOutput = Array(combinedReference[0..<consumed])
         return (cleanedMic, referenceForOutput)
     }
 
-    /// Cancels and returns whatever partial audio `cancelEcho` is still holding back, by
-    /// zero-padding each remainder up to one full frame (they may now differ in length - see
-    /// `cancelEcho` - so each is padded from its own tail rather than assuming they match). Call
-    /// once, after the last `cancelEcho` call of a session, so the last fraction of a second of
-    /// audio is never silently dropped when a session ends.
+    /// Cancels and returns everything `cancelEcho` is still holding in `micRemainder`/
+    /// `referenceRemainder` - including any full frames that were deferred by the reference-lag
+    /// bound above, not just a single trailing partial frame - so a session's last stretch of
+    /// audio (mic-only or not) is never dropped when it ends. Call once, after the last
+    /// `cancelEcho` call of a session.
     func flush() -> (mic: [Int16], reference: [Int16]) {
         guard !micRemainder.isEmpty || !referenceRemainder.isEmpty else { return ([], []) }
         let frameSize = Int(Self.frameSize)
-        let micTail = Array(micRemainder.suffix(frameSize))
-        let referenceTail = Array(referenceRemainder.suffix(frameSize))
-        let validCount = max(micTail.count, referenceTail.count)
+        let validCount = max(micRemainder.count, referenceRemainder.count)
+        let frameCount = (validCount + frameSize - 1) / frameSize
+        let totalCount = frameCount * frameSize
 
-        var micFrame = micTail + [Int16](repeating: 0, count: frameSize - micTail.count)
-        var referenceFrame = referenceTail + [Int16](repeating: 0, count: frameSize - referenceTail.count)
-        var cleaned = [Int16](repeating: 0, count: frameSize)
-        micFrame.withUnsafeMutableBufferPointer { micPtr in
-            referenceFrame.withUnsafeMutableBufferPointer { refPtr in
+        var micPadded = micRemainder + [Int16](repeating: 0, count: totalCount - micRemainder.count)
+        var referencePadded = referenceRemainder + [Int16](repeating: 0, count: totalCount - referenceRemainder.count)
+        var cleaned = [Int16](repeating: 0, count: totalCount)
+        micPadded.withUnsafeMutableBufferPointer { micPtr in
+            referencePadded.withUnsafeMutableBufferPointer { refPtr in
                 cleaned.withUnsafeMutableBufferPointer { cleanedPtr in
-                    speex_echo_cancellation(echoState, micPtr.baseAddress!, refPtr.baseAddress!, cleanedPtr.baseAddress!)
+                    for i in 0..<frameCount {
+                        let offset = i * frameSize
+                        speex_echo_cancellation(
+                            echoState, micPtr.baseAddress! + offset, refPtr.baseAddress! + offset,
+                            cleanedPtr.baseAddress! + offset)
+                    }
                 }
             }
         }
 
         micRemainder = []
         referenceRemainder = []
-        return (Array(cleaned[0..<validCount]), Array(referenceFrame[0..<validCount]))
+        return (Array(cleaned[0..<validCount]), Array(referencePadded[0..<validCount]))
     }
 }

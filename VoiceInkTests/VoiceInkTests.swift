@@ -1125,10 +1125,10 @@ struct SettingsBackupPinnedDestinationFieldsTests {
 // MARK: - Meeting Capture: automatic chunk send trigger (pure policy)
 
 struct MeetingAutoSendPolicyTests {
-    @Test func doesNotSendBeforeTheMinimumSpeechAccumulates() {
+    @Test func doesNotSendBeforeTheMinimumSpeechAccumulatesAndTheShortPauseHasNotHappenedEither() {
         #expect(
             MeetingAutoSendPolicy.shouldSend(
-                speechSecondsSinceLastChunk: 3, currentSilenceDuration: 10, secondsSinceLastChunk: 10) == false)
+                speechSecondsSinceLastChunk: 3, currentSilenceDuration: 2, secondsSinceLastChunk: 5) == false)
     }
 
     @Test func doesNotSendOnEnoughSpeechWithoutATrailingPauseYet() {
@@ -1152,10 +1152,21 @@ struct MeetingAutoSendPolicyTests {
     @Test func doesNotSendJustBelowEitherThreshold() {
         #expect(
             MeetingAutoSendPolicy.shouldSend(
-                speechSecondsSinceLastChunk: 4.9, currentSilenceDuration: 5, secondsSinceLastChunk: 5) == false)
+                speechSecondsSinceLastChunk: 4.9, currentSilenceDuration: 2, secondsSinceLastChunk: 5) == false)
         #expect(
             MeetingAutoSendPolicy.shouldSend(
                 speechSecondsSinceLastChunk: 25, currentSilenceDuration: 0.99, secondsSinceLastChunk: 59.9) == false)
+    }
+
+    // A single short sentence (~3 s) followed by a long pause used to never send until the 60 s
+    // cap - see `shortUtteranceTrailingSilenceSeconds`.
+    @Test func sendsAShortUtteranceOnceTheLongerPauseThresholdIsReached() {
+        #expect(
+            MeetingAutoSendPolicy.shouldSend(
+                speechSecondsSinceLastChunk: 3, currentSilenceDuration: 3, secondsSinceLastChunk: 6) == true)
+        #expect(
+            MeetingAutoSendPolicy.shouldSend(
+                speechSecondsSinceLastChunk: 3, currentSilenceDuration: 1.5, secondsSinceLastChunk: 4.5) == false)
     }
 }
 
@@ -1253,18 +1264,18 @@ struct MeetingAutoSendEvaluatorFrameResolutionTests {
         #expect(time < 10, "must fire during the pause, not wait for the 60 s cap (fired at \(time)s)")
     }
 
-    @Test func belowTheMinimumSpeechNeverTriggersNaturallyOnlyTheSixtySecondCapCanFireIt() {
-        // 3 s of speech - below the 5 s floor - followed by silence well past the 60 s cap: the
-        // natural trailing-silence trigger never fires (speech never reaches the floor), but the
-        // cap still fires once `secondsSinceLastChunk` reaches 60, because there is something
-        // (the 3 s of speech) to send.
+    @Test func belowTheMinimumSpeechTriggersEarlyViaTheShortPauseRuleRatherThanWaitingForTheCap() {
+        // 3 s of speech - below the 5 s floor for the old rule - followed by a long pause: the
+        // short-pause rule (see `MeetingAutoSendPolicy.shortUtteranceTrailingSilenceSeconds`) now
+        // fires once silence reaches 3 s, well before the 60 s cap.
         let stream = Self.tone(seconds: 3) + Self.silence(seconds: 65)
 
         guard let time = Self.firstTriggerTime(stream) else {
-            Issue.record("expected the 60 s cap to fire eventually, got no trigger at all")
+            Issue.record("expected a trigger during the pause, got none")
             return
         }
-        #expect(time >= 60, "must not fire before the 60 s cap even though speech never reached the floor")
+        #expect(time >= 6, "must not fire before 3 s speech + 3 s trailing silence")
+        #expect(time < 60, "must fire via the short-pause rule, not wait for the 60 s cap (fired at \(time)s)")
     }
 
     @Test func eightHundredMsGapsBetweenBurstsNeverTriggerAtHalfSecondTicks() {

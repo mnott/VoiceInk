@@ -300,7 +300,7 @@ class RecordingShortcutManager: ObservableObject {
         case .meetingCapture:
             engine.toggleMeetingCapture()
         case .meetingChunk:
-            engine.sendMeetingChunk()
+            await engine.sendMeetingChunk()
         default:
             break
         }

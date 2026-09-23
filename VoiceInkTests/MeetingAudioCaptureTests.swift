@@ -196,6 +196,32 @@ struct EchoCancellerTests {
         #expect(secondReference.count == 320)
     }
 
+    @Test func cancelEchoWithMicOnlyAndEmptyReferenceReleasesAudioInsteadOfStarvingItForever() {
+        // Simulates nothing playing on the Mac: the process tap delivers no reference samples at
+        // all, tick after tick. Without the reference-lag bound this would starve forever - all
+        // mic audio piling up in micRemainder and nothing ever reaching the meeting file (the
+        // "delivered=0 deferred=0" bug).
+        let canceller = EchoCanceller()
+        let tickSamples = 8000 // 0.5 s at 16 kHz, matching MeetingAudioCapture's real drain interval
+        var totalMic = 0
+        var totalReleased = 0
+        for _ in 0..<20 { // 10 s of ticks
+            let (cleaned, reference) = canceller.cancelEcho(
+                mic: [Int16](repeating: 0, count: tickSamples), reference: [])
+            #expect(cleaned.count == reference.count)
+            totalMic += tickSamples
+            totalReleased += cleaned.count
+        }
+        // Each tick is well beyond the reference-lag bound, so nearly all of it is released on
+        // that same tick rather than piling up waiting for a reference that never comes.
+        #expect(totalReleased >= totalMic - EchoCanceller.maxReferenceLagSamples - 320)
+
+        let (flushedMic, flushedReference) = canceller.flush()
+        #expect(flushedMic.count == flushedReference.count)
+        // Nothing lost overall: every mic sample either came back from cancelEcho or from flush.
+        #expect(totalReleased + flushedMic.count == totalMic)
+    }
+
     @Test func cancelEchoSkipsCancellationWhenThereIsNoSystemAudioBecauseCutFallsBackToPlainMix() {
         // Mirrors what MeetingAudioCapture.cut() does when isCapturingSystemAudio is false: mix
         // the mic straight through with no echo canceller involved.
@@ -429,6 +455,28 @@ struct MeetingAudioCaptureChunkBoundaryTests {
         let released = buffer.releasePrefix(sampleCount: boundary)
         baseOffset += released.mic.count
         return released.mic
+    }
+
+    @Test func lastWordEndingExactlyAtHotkeyPressIsNotDeferredWhenForcingFullRelease() {
+        // Reproduces the reported bug: the hotkey is pressed the instant the last word ends, so
+        // the VAD's 500 ms hangover has not closed its region yet. An automatic-style cut would
+        // defer the whole still-open word to a much later chunk; a manual send instead forces
+        // full release (see `MeetingAudioCapture.cutForManualSend`) so it ships immediately.
+        let lastWord = loud(6400)
+        var buffer = MeetingDrainBuffer()
+        var micState = MeetingVAD.State.initial
+        var systemState = MeetingVAD.State.initial
+        var baseOffset = 0
+
+        absorb(lastWord, into: &buffer, micState: &micState, systemState: &systemState)
+
+        let deferredBoundary = MeetingAutoSendEvaluator.cutBoundary(
+            micVADState: micState, systemVADState: systemState, chunkPendingBaseOffset: baseOffset, forceFullRelease: false)
+        #expect(deferredBoundary == 0, "an automatic-style cut would defer the whole still-open word")
+
+        let released = cut(
+            from: &buffer, micState: micState, systemState: systemState, baseOffset: &baseOffset, forceFullRelease: true)
+        #expect(released == lastWord, "a manual send must not defer the open utterance - deliver it whole")
     }
 
     @Test func anUtteranceOpenAtCutTimeSurvivesWholeInTheNextChunkAcrossThreeConsecutiveCutsWithNoLossOrDuplication() {

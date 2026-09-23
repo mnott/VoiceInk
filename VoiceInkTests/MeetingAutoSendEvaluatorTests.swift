@@ -113,4 +113,30 @@ struct MeetingAutoSendEvaluatorTests {
             "the later, cleanly-closed utterance's natural silence trigger must still fire")
         #expect(delivered > 0)
     }
+
+    @Test func speechIsMeasuredAsUtteranceSpanNotJustVoicedFrames() {
+        // Reproduces the reported bug: with some mics most frames between syllables fall below
+        // the energy threshold even mid-word, so counting only voiced frames made the 5 s floor
+        // practically unreachable. An utterance where only ~25% of frames are actually voiced
+        // (alternating 20 ms loud / 60 ms silent, well under the 500 ms hangover so the region
+        // never closes) must still count as ~10 s of speech - the span from first to last voiced
+        // frame, not the sum of voiced frames.
+        let frameSamples = MeetingVAD.frameSamples
+        let loudFrame = [Int16](repeating: 6000, count: frameSamples)
+        let silentFrames = [Int16](repeating: 0, count: frameSamples * 3)
+        var mic: [Int16] = []
+        while Double(mic.count) / Self.sampleRate < 10 {
+            mic += loudFrame + silentFrames
+        }
+        let system = [Int16](repeating: 0, count: mic.count)
+
+        let result = MeetingAutoSendEvaluator.step(
+            mic: mic, system: system, sampleRate: Self.sampleRate, autoSendEnabled: true,
+            micVADState: .initial, systemVADState: .initial, tracker: MeetingAutoSendTracker())
+
+        #expect(
+            result.tracker.speechSecondsSinceLastChunk >= 9.5,
+            "the whole span must count as speech, not just the ~25% of voiced frames (got \(result.tracker.speechSecondsSinceLastChunk)s)"
+        )
+    }
 }

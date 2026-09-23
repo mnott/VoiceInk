@@ -28,7 +28,12 @@ extension VoiceInkEngine {
             isMeetingCaptureActive = false
             meetingCapture = nil
 
-            deliverMeetingChunk(from: capture, notifyWhenEmpty: false, forceFullRelease: true)
+            if let capture {
+                let cut = capture.cut(forceFullRelease: true)
+                deliverMeetingChunk(
+                    cut: cut, isCapturingSystemAudio: capture.isCapturingSystemAudio, notifyWhenEmpty: false,
+                    isAutomatic: false)
+            }
             let sessionRecordingURL = capture?.recordingURL
             capture?.stop()
 
@@ -69,39 +74,42 @@ extension VoiceInkEngine {
         }
     }
 
-    func sendMeetingChunk() {
-        guard isMeetingCaptureActive else {
+    /// Manual (hotkey) chunk send. Delays the cut (see `MeetingAudioCapture.cutForManualSend`) and
+    /// forces full release, so the last word spoken right up to the key press - whose VAD region
+    /// may not have closed yet - is never deferred to a later chunk the way an automatic cut's
+    /// open-utterance check would defer it.
+    func sendMeetingChunk() async {
+        guard isMeetingCaptureActive, let capture = meetingCapture else {
             NotificationManager.shared.showNotification(
                 title: String(localized: "Meeting capture is not running"),
                 type: .info
             )
             return
         }
-        deliverMeetingChunk(from: meetingCapture, notifyWhenEmpty: true)
+        let cut = await capture.cutForManualSend()
+        deliverMeetingChunk(
+            cut: cut, isCapturingSystemAudio: capture.isCapturingSystemAudio, notifyWhenEmpty: true,
+            isAutomatic: false)
     }
 
     /// Called from `MeetingAudioCapture.onAutoSendTrigger` (see `MeetingAutoSendPolicy`) once a
     /// natural turn boundary is found. Goes through exactly the same delivery path as the manual
     /// hotkey - same labels, same pinned delivery, silent, no History record - just without the
-    /// "nothing to send" notification a user press would show.
+    /// "nothing to send" notification a user press would show, and without forcing full release
+    /// (an open utterance is deferred to the next chunk, same as any other automatic cut).
     func sendMeetingChunkAutomatically() {
-        guard isMeetingCaptureActive else { return }
-        deliverMeetingChunk(from: meetingCapture, notifyWhenEmpty: false)
+        guard isMeetingCaptureActive, let capture = meetingCapture else { return }
+        let cut = capture.cut()
+        deliverMeetingChunk(
+            cut: cut, isCapturingSystemAudio: capture.isCapturingSystemAudio, notifyWhenEmpty: false,
+            isAutomatic: true)
     }
 
     // MARK: - Per-chunk delivery (paste-only, never saved to History)
 
     private func deliverMeetingChunk(
-        from capture: MeetingAudioCapture?, notifyWhenEmpty: Bool, forceFullRelease: Bool = false
+        cut: MeetingAudioCapture.MeetingCut, isCapturingSystemAudio: Bool, notifyWhenEmpty: Bool, isAutomatic: Bool
     ) {
-        guard let capture else { return }
-        let cut = capture.cut(forceFullRelease: forceFullRelease)
-        let isCapturingSystemAudio = capture.isCapturingSystemAudio
-
-        // Manual (`sendMeetingChunk`) always notifies when empty; the automatic trigger and the
-        // stop-time forced flush never do - this is the same distinction those two call sites use,
-        // read back out here instead of adding a separate parameter just for the log line.
-        let isAutomatic = !notifyWhenEmpty && !forceFullRelease
         Self.meetingLogger.info(
             "Meeting chunk delivery: delivered=\(cut.mix.count, privacy: .public) deferred=\(cut.deferredSampleCount, privacy: .public) automatic=\(isAutomatic, privacy: .public)"
         )

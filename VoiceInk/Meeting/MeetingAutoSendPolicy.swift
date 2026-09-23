@@ -10,6 +10,13 @@ enum MeetingAutoSendPolicy {
     /// Once there is enough speech, sending waits for both channels to have been silent this
     /// long - a natural turn boundary rather than cutting someone off mid-sentence.
     static let requiredTrailingSilenceSeconds: TimeInterval = 1.0
+    /// The second, shorter-speech rule below only applies once there is at least this much real
+    /// speech - not literally any voiced frame at all - since the last chunk.
+    static let minimumRealSpeechSecondsForShortPauseRule: TimeInterval = 0.5
+    /// A short utterance (below `minimumSpeechSecondsSinceLastChunk`) still sends once silence
+    /// has gone on this long, so a single short sentence followed by a long pause is not stuck
+    /// waiting for the 60 s cap.
+    static let shortUtteranceTrailingSilenceSeconds: TimeInterval = 3.0
     /// If no such pause happens (a long uninterrupted monologue), send anyway rather than let a
     /// chunk grow without bound.
     static let maximumSecondsSinceLastChunk: TimeInterval = 60
@@ -20,6 +27,11 @@ enum MeetingAutoSendPolicy {
         secondsSinceLastChunk: TimeInterval
     ) -> Bool {
         if secondsSinceLastChunk >= maximumSecondsSinceLastChunk {
+            return true
+        }
+
+        if speechSecondsSinceLastChunk >= minimumRealSpeechSecondsForShortPauseRule
+            && currentSilenceDuration >= shortUtteranceTrailingSilenceSeconds {
             return true
         }
 

@@ -48,6 +48,11 @@ final class MeetingAudioCapture: @unchecked Sendable {
 
     private var autoSendTracker = MeetingAutoSendTracker()
     private var isAutoSendPending = false
+    // Longer than MeetingVAD's 500 ms hangover: a manual cut (`cutForManualSend`) waits this long
+    // first, so a word spoken right up to the hotkey press has time to actually arrive from the
+    // tap and its VAD region to close, before `cut(forceFullRelease: true)` releases everything
+    // regardless - see `cutForManualSend`.
+    static let manualCutDelaySeconds: TimeInterval = 0.6
     // Carries `MeetingVAD`'s adaptive noise floor and in-speech/hangover state across drain
     // ticks per channel. Always kept current (whether or not auto-send is on) since `cut()` also
     // needs it to know whether a chunk boundary would land inside an open utterance.
@@ -160,9 +165,9 @@ final class MeetingAudioCapture: @unchecked Sendable {
     /// small increments (see `drainTick`/`startDrainTimer`) so this is normally just picking up
     /// whatever those increments have already queued, not a large amount of new work.
     /// - Parameter forceFullRelease: Skips the open-utterance safe-boundary check below and
-    ///   releases everything pending regardless. Used only when capture is about to stop (see
-    ///   `VoiceInkEngine+Meeting.toggleMeetingCapture()`), since there is no "next chunk" left for
-    ///   a held-back tail to land in there.
+    ///   releases everything pending regardless. Used when capture is about to stop (see
+    ///   `VoiceInkEngine+Meeting.toggleMeetingCapture()`) and by `cutForManualSend()` - neither
+    ///   has a guaranteed-soon "next chunk" to hand a held-back tail to.
     func cut(forceFullRelease: Bool = false) -> MeetingCut {
         let (mic, system, micNoiseFloor, systemNoiseFloor, deferredCount) = tapQueue.sync {
             () -> ([Int16], [Int16], Double, Double, Int) in
@@ -192,6 +197,15 @@ final class MeetingAudioCapture: @unchecked Sendable {
         return MeetingCut(
             mic: mic, system: system, mix: Self.mix(mic: mic, system: system),
             micNoiseFloor: micNoiseFloor, systemNoiseFloor: systemNoiseFloor, deferredSampleCount: deferredCount)
+    }
+
+    /// A manual (hotkey) chunk cut. Waits `manualCutDelaySeconds` first - long enough for a word
+    /// spoken right up to the key press to finish arriving and its VAD region to close - then
+    /// forces full release regardless, so the last word is never held back for a later, possibly
+    /// much-delayed chunk the way an automatic cut's open-utterance deferral would (see `cut`).
+    func cutForManualSend() async -> MeetingCut {
+        try? await Task.sleep(nanoseconds: UInt64(Self.manualCutDelaySeconds * 1_000_000_000))
+        return cut(forceFullRelease: true)
     }
 
     // MARK: - Periodic draining
