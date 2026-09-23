@@ -110,6 +110,18 @@ struct GeneralBackup: Codable {
     let pinnedDestinationEnterRules: [PinnedDestinationEnterRule]?
     let highlightPinnedITermSession: Bool?
     let pinnedITermTintColorHex: String?
+
+    let meetingCaptureShortcut: ShortcutBackup?
+    let meetingChunkShortcut: ShortcutBackup?
+
+    // All bindings (0..n) for the two meeting actions - see `ShortcutStore`. The singular fields
+    // above still carry the first binding for anything reading an older-format backup; these
+    // carry the rest. Both are optional so a backup written before multiple bindings existed
+    // still imports.
+    let meetingCaptureShortcuts: [ShortcutBackup]?
+    let meetingChunkShortcuts: [ShortcutBackup]?
+
+    let sendMeetingChunksAutomatically: Bool?
 }
 
 struct WordBackup: Codable {

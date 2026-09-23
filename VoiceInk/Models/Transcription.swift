@@ -30,6 +30,10 @@ final class Transcription {
     @Attribute(originalName: "powerModeEmoji")
     var modeEmoji: String?
     var transcriptionStatus: String?
+    /// Whether this record is the one continuous, speaker-labelled transcript of a Meeting
+    /// Capture session (left = "Me"/mic, right = "Others"/system in `audioFileURL`), rather than
+    /// a normal dictation. Defaults to `false` so existing records need no migration.
+    var isMeetingRecording: Bool = false
 
     init(
         text: String,
@@ -45,7 +49,8 @@ final class Transcription {
         aiRequestUserMessage: String? = nil,
         modeName: String? = nil,
         modeEmoji: String? = nil,
-        transcriptionStatus: TranscriptionStatus = .pending
+        transcriptionStatus: TranscriptionStatus = .pending,
+        isMeetingRecording: Bool = false
     ) {
         self.id = UUID()
         self.text = text
@@ -63,6 +68,7 @@ final class Transcription {
         self.modeName = modeName
         self.modeEmoji = modeEmoji
         self.transcriptionStatus = transcriptionStatus.rawValue
+        self.isMeetingRecording = isMeetingRecording
     }
 
     func markAsCanceledTranscription(

@@ -13,6 +13,7 @@ final class TranscriptionDelivery {
         let responseConfig: EnhancementRuntimeConfiguration?
         let responseError: String?
         let isAssistantFollowUp: Bool
+        let playsFeedbackSound: Bool
     }
 
     struct Actions {
@@ -52,10 +53,17 @@ final class TranscriptionDelivery {
         }
 
         if let text = request.text {
-            await paste(text, output: request.output, actions: actions)
+            await paste(text, output: request.output, playsFeedbackSound: request.playsFeedbackSound, actions: actions)
         } else {
             await actions.dismiss()
         }
+    }
+
+    /// Every delivery path funnels its stop sound through here so meeting-capture
+    /// deliveries (`Request.playsFeedbackSound == false`) stay silent everywhere.
+    private func playFeedbackSound(_ enabled: Bool) {
+        guard enabled else { return }
+        SoundManager.shared.playStopSound()
     }
 
     /// Routes delivery to the pinned destination instead of `CursorPaster`, which
@@ -63,20 +71,20 @@ final class TranscriptionDelivery {
     /// the pin exists precisely so the user can look elsewhere while dictating.
     private func deliverToPinnedDestination(_ item: Request, actions: Actions) async {
         guard let text = item.text else {
-            SoundManager.shared.playStopSound()
+            playFeedbackSound(item.playsFeedbackSound)
             await actions.dismiss()
             return
         }
 
         let textToDeliver = deliverableText(from: text)
-        SoundManager.shared.playStopSound()
+        playFeedbackSound(item.playsFeedbackSound)
         await actions.dismiss()
 
-        await PinnedDestinationManager.shared.deliver(text: textToDeliver)
+        await PinnedDestinationManager.shared.deliver(text: textToDeliver, playSound: item.playsFeedbackSound)
     }
 
     private func deliverFollowUp(_ item: Request, actions: Actions) async {
-        SoundManager.shared.playStopSound()
+        playFeedbackSound(item.playsFeedbackSound)
 
         guard let text = item.text?.trimmingCharacters(in: .whitespacesAndNewlines),
             !text.isEmpty
@@ -89,7 +97,7 @@ final class TranscriptionDelivery {
     }
 
     private func deliverResponse(_ item: Request, actions: Actions) async {
-        SoundManager.shared.playStopSound()
+        playFeedbackSound(item.playsFeedbackSound)
 
         if let responseError = item.responseError {
             await actions.failResponse("Enhancement failed: \(responseError)")
@@ -105,7 +113,7 @@ final class TranscriptionDelivery {
     private func deliverCustomCommand(_ item: Request, actions: Actions) async {
         guard let text = item.text else {
             notifyCustomCommandFailure(CustomCommandDeliveryError.noTextToDeliver)
-            SoundManager.shared.playStopSound()
+            playFeedbackSound(item.playsFeedbackSound)
             await actions.dismiss()
             return
         }
@@ -114,7 +122,7 @@ final class TranscriptionDelivery {
             let command = customCommand.trimmedCommand
         else {
             notifyCustomCommandFailure(CustomCommandDeliveryError.commandNotConfigured)
-            SoundManager.shared.playStopSound()
+            playFeedbackSound(item.playsFeedbackSound)
             await actions.dismiss()
             return
         }
@@ -149,7 +157,7 @@ final class TranscriptionDelivery {
             autoSendKey = Self.resolvedAutoSendKey(for: item.output)
         }
 
-        SoundManager.shared.playStopSound()
+        playFeedbackSound(item.playsFeedbackSound)
         await actions.dismiss()
 
         // `sendInsertPrefix` is only ever true when a rule was resolved, which in turn only
@@ -250,7 +258,7 @@ final class TranscriptionDelivery {
         String(format: "%.3f", duration)
     }
 
-    private func paste(_ text: String, output: OutputRuntimeConfiguration, actions: Actions) async {
+    private func paste(_ text: String, output: OutputRuntimeConfiguration, playsFeedbackSound: Bool, actions: Actions) async {
         let textToPaste = deliverableText(from: text)
 
         // Captured before the panel is dismissed or the paste starts - see the doc comment on
@@ -279,7 +287,7 @@ final class TranscriptionDelivery {
             autoSendKey = modeAutoSendKey != .none ? modeAutoSendKey : (decision.submit ? .enter : .none)
         }
 
-        SoundManager.shared.playStopSound()
+        playFeedbackSound(playsFeedbackSound)
         await actions.dismiss()
 
         // `sendInsertPrefix` is only ever true when a rule was resolved, which in turn only

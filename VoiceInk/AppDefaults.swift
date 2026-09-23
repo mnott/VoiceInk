@@ -32,6 +32,12 @@ enum PinnedDestinationSettingsKeys {
     /// `PinnedDestinationManager.markITermSessionPinned`). Registered with a default below so
     /// anyone who never opens this setting keeps seeing the original built-in green, fully opaque.
     static let pinnedITermTintColorHex = "PinnedITermTintColorHex"
+
+    /// Whether Meeting Capture delivers a chunk on its own at a natural pause instead of only on
+    /// the Send Meeting Chunk shortcut - see `VoiceInkEngine+Meeting`'s auto-send trigger. Off by
+    /// default: silently auto-pasting into whatever is focused (or pinned) is not something to
+    /// start doing without an explicit opt-in.
+    static let sendMeetingChunksAutomatically = "SendMeetingChunksAutomatically"
 }
 
 enum AppDefaults {

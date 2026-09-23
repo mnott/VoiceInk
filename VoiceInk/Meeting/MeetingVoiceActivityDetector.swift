@@ -1,0 +1,165 @@
+import Foundation
+
+/// Splits one channel of 16 kHz mono Int16 audio into speech regions using frame energy against
+/// an adaptive noise floor - service-agnostic (unlike fixed-window transcription, this needs no
+/// timestamps back from `TranscriptionService`, which none of the seven providers behind it give).
+/// `process(_:state:)` threads its state across calls so a long recording can be analyzed in
+/// bounded-memory blocks instead of loading the whole file at once; `finish(state:)` closes out
+/// any speech run still open at the end of the stream.
+enum MeetingVAD {
+    struct Region: Equatable {
+        let start: Int
+        let end: Int
+    }
+
+    struct State: Equatable {
+        var noiseFloor: Double
+        var inSpeech = false
+        var speechStart = 0
+        /// Sample index right after the last frame that was voiced - carried across block
+        /// boundaries so a region that spans two `process()` calls still closes at the right
+        /// point, not at whatever frame happened to end the block it was detected in.
+        var lastVoicedEnd = 0
+        var framesSinceLastVoiced = 0
+        var globalSampleOffset = 0
+        var leftoverSamples: [Int16] = []
+
+        static let initial = State(noiseFloor: 0)
+    }
+
+    static let sampleRate: Double = 16000
+    static let frameSamples = Int(0.02 * sampleRate)  // 20 ms
+    static let hangoverFrames = Int(0.5 / 0.02)  // 500 ms of trailing silence closes a region
+    static let minUtteranceSamples = Int(0.3 * sampleRate)  // 300 ms
+    static let paddingSamples = Int(0.15 * sampleRate)  // 150 ms of real audio kept each side
+    // ~-46 dBFS at 16-bit: below this a frame is silence regardless of how low the adaptive
+    // noise floor has drifted, so true silence never gets misread as speech.
+    static let absoluteFloor: Double = 150
+    static let marginAboveNoiseFloor: Double = 200
+    static let noiseFloorAdaptRate: Double = 0.05
+    // The floor above only moves on frames already classified silent - if a channel's ambient
+    // level starts out above the not-yet-adapted threshold (e.g. steady mic noise/room hum, before
+    // any real silence has been seen), every frame keeps reading as speech and the floor is stuck
+    // at its initial value forever: the channel never closes its "utterance", pinning
+    // currentSilenceDuration at 0 and openRegionStart at the very start of the session, so neither
+    // the natural silence trigger nor cutBoundary can ever release anything. A much slower nudge
+    // toward the observed energy even while classified as speech lets a merely-stationary signal
+    // catch up to its own threshold and reclassify as silence within a few seconds, while a normal
+    // (tens-of-seconds) speech utterance barely moves the floor in that time.
+    static let stuckSpeechNoiseFloorAdaptRate: Double = 0.005
+
+    /// Frame energy for one frame; also used by `MeetingTurnBuilder` to find internal pauses
+    /// inside an already-detected speech region.
+    static func rms(_ samples: ArraySlice<Int16>) -> Double {
+        guard !samples.isEmpty else { return 0 }
+        let sumSquares = samples.reduce(0.0) { $0 + Double($1) * Double($1) }
+        return (sumSquares / Double(samples.count)).squareRoot()
+    }
+
+    /// Processes one block of samples. Returns regions that closed (500 ms of trailing silence
+    /// seen) within this block, in sample coordinates spanning the whole stream, the number of
+    /// samples in this block whose frame was classified as voiced (for `MeetingAutoSendEvaluator`'s
+    /// frame-resolution speech-seconds accounting), plus the state to pass into the next call.
+    static func process(_ samples: [Int16], state: State) -> (regions: [Region], voicedSamples: Int, state: State) {
+        var state = state
+        let combined = state.leftoverSamples + samples
+        let frameCount = combined.count / frameSamples
+        let consumed = frameCount * frameSamples
+        state.leftoverSamples = Array(combined[consumed...])
+
+        var regions: [Region] = []
+        var voicedSamples = 0
+        for i in 0..<frameCount {
+            let frameStart = i * frameSamples
+            let frame = combined[frameStart..<frameStart + frameSamples]
+            let energy = rms(frame)
+            let absoluteStart = state.globalSampleOffset + frameStart
+            let absoluteEnd = absoluteStart + frameSamples
+            let threshold = max(absoluteFloor, state.noiseFloor + marginAboveNoiseFloor)
+
+            if energy >= threshold {
+                if !state.inSpeech {
+                    state.inSpeech = true
+                    state.speechStart = absoluteStart
+                }
+                state.lastVoicedEnd = absoluteEnd
+                state.framesSinceLastVoiced = 0
+                voicedSamples += frameSamples
+                // Nudged toward `absoluteFloor`, not the frame's own (possibly very loud) energy:
+                // this only needs to climb enough to unstick a channel whose ambient level sits
+                // just above the not-yet-adapted threshold, not all the way up to genuine speech
+                // loudness - otherwise a long, real, uninterrupted monologue would eventually catch
+                // its own noise floor up to itself and get spuriously reclassified as silence too.
+                let stuckAdaptTarget = min(energy, absoluteFloor)
+                state.noiseFloor = state.noiseFloor * (1 - stuckSpeechNoiseFloorAdaptRate) + stuckAdaptTarget * stuckSpeechNoiseFloorAdaptRate
+            } else {
+                state.noiseFloor = state.noiseFloor * (1 - noiseFloorAdaptRate) + energy * noiseFloorAdaptRate
+                if state.inSpeech {
+                    state.framesSinceLastVoiced += 1
+                    if state.framesSinceLastVoiced >= hangoverFrames {
+                        if let region = closedRegion(state: state, processedEnd: state.globalSampleOffset + consumed) {
+                            regions.append(region)
+                        }
+                        state.inSpeech = false
+                        state.framesSinceLastVoiced = 0
+                    }
+                }
+            }
+        }
+        state.globalSampleOffset += consumed
+        return (regions, voicedSamples, state)
+    }
+
+    /// Closes any speech run still open at end of stream (no trailing silence long enough to have
+    /// closed it already), so the last utterance of a recording is never dropped.
+    static func finish(state: State) -> [Region] {
+        guard state.inSpeech else { return [] }
+        return [closedRegion(state: state, processedEnd: state.globalSampleOffset)].compactMap { $0 }
+    }
+
+    /// Convenience for a whole buffer already in memory (chunk delivery, or one silence-bounded
+    /// super-block of a longer recording) - `process` then `finish` in one call.
+    /// - Parameter startingNoiseFloor: Seeds the adaptive noise floor instead of starting from 0 -
+    ///   used when `samples` is the continuation of a chunk-hotkey cut (see
+    ///   `MeetingAudioCapture.MeetingCut`), so a chunk that opens mid-utterance (no leading silence
+    ///   of its own to (re-)adapt against) classifies its first frames against the same threshold
+    ///   the session had already converged on rather than a fresh, unrepresentative one.
+    static func regions(for samples: [Int16], startingNoiseFloor: Double = 0) -> [Region] {
+        let (closed, _, state) = process(samples, state: State(noiseFloor: startingNoiseFloor))
+        return closed + finish(state: state)
+    }
+
+    private static func closedRegion(state: State, processedEnd: Int) -> Region? {
+        // Filtered on the raw voiced span, before padding is added - otherwise a couple of
+        // frames of spurious noise would clear the 300 ms bar on padding alone.
+        guard state.lastVoicedEnd - state.speechStart >= minUtteranceSamples else { return nil }
+        let start = max(0, state.speechStart - paddingSamples)
+        let end = min(state.lastVoicedEnd + paddingSamples, processedEnd)
+        return Region(start: start, end: end)
+    }
+
+    /// Runs of frames below `threshold` for at least `minRunSamples` within `range` of `samples` -
+    /// used by `MeetingTurnBuilder` to find a natural place to split a region an interjection
+    /// lands inside, or to split a region that has grown past the turn length cap.
+    static func silenceRuns(
+        in samples: [Int16], range: Range<Int>, minRunSamples: Int, threshold: Double = absoluteFloor
+    ) -> [Range<Int>] {
+        var runs: [Range<Int>] = []
+        var runStart: Int?
+        var i = range.lowerBound
+        while i + frameSamples <= range.upperBound {
+            let energy = rms(samples[i..<i + frameSamples])
+            if energy < threshold {
+                if runStart == nil { runStart = i }
+            } else if let start = runStart {
+                if i - start >= minRunSamples { runs.append(start..<i) }
+                runStart = nil
+            }
+            i += frameSamples
+        }
+        if let start = runStart, range.upperBound - start >= minRunSamples {
+            runs.append(start..<range.upperBound)
+        }
+        return runs
+    }
+}

@@ -231,7 +231,31 @@ enum BackupImporter {
             UserDefaults.standard.set(tintColorHex, forKey: PinnedDestinationSettingsKeys.pinnedITermTintColorHex)
         }
 
+        importMeetingShortcuts(
+            action: .meetingCapture, bindings: general.meetingCaptureShortcuts,
+            singleBinding: general.meetingCaptureShortcut)
+        importMeetingShortcuts(
+            action: .meetingChunk, bindings: general.meetingChunkShortcuts,
+            singleBinding: general.meetingChunkShortcut)
+
+        if let sendChunksAutomatically = general.sendMeetingChunksAutomatically {
+            UserDefaults.standard.set(
+                sendChunksAutomatically, forKey: PinnedDestinationSettingsKeys.sendMeetingChunksAutomatically)
+        }
+
         print("Successfully imported general settings.")
+    }
+
+    /// Prefers the plural (all-bindings) field; falls back to the singular one from a backup
+    /// written before an action could have more than one shortcut.
+    private static func importMeetingShortcuts(
+        action: ShortcutAction, bindings: [ShortcutBackup]?, singleBinding: ShortcutBackup?
+    ) {
+        if let bindings, !bindings.isEmpty {
+            ShortcutStore.setShortcuts(bindings.map(\.shortcut), for: action)
+        } else if let singleBinding {
+            ShortcutStore.setShortcut(singleBinding.shortcut, for: action)
+        }
     }
 
     @MainActor

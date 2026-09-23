@@ -119,7 +119,11 @@ class VoiceInkEngine: NSObject, ObservableObject {
     let enhancementService: AIEnhancementService?
     let assistantSession = AssistantSession()
     let assistantChat: AssistantChatService?
-    private let pipeline: TranscriptionPipeline
+    let pipeline: TranscriptionPipeline
+
+    @Published var isMeetingCaptureActive = false
+    var meetingCapture: MeetingAudioCapture?
+    var meetingChunkTask: Task<Void, Never>?
 
     let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "VoiceInkEngine")
 
@@ -722,7 +726,7 @@ class VoiceInkEngine: NSObject, ObservableObject {
         }
     }
 
-    private func makeRecordingTranscription(
+    func makeRecordingTranscription(
         for audioURL: URL,
         text: String,
         duration: TimeInterval,

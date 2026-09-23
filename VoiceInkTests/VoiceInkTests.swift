@@ -7,6 +7,7 @@
 
 import Testing
 import Foundation
+import AppKit
 import ApplicationServices
 @testable import VoiceInk
 
@@ -248,6 +249,9 @@ struct PinnedDestinationAXDeliveryResolutionTests {
     }
 
     @Test func deadElementWithDeadAppReportsGone() {
+        // `.reportGone` only ever clears the (cosmetic) iTerm tint marking and copies
+        // the text to the clipboard - never the pin itself. Only an explicit user
+        // unpin does that; see `PinnedDestinationManager.reportGone`.
         let decision = PinnedDestinationManager.decideAXDeliveryResolution(
             cachedElementAlive: false, appAlive: false, reResolvedElementPresent: false
         )
@@ -297,6 +301,106 @@ struct PinnedDestinationAppleScriptErrorClassificationTests {
         // dictionary - but a benign/unexpected code must not be read as a permission
         // failure, which would wrongly leave a genuinely broken pin in place.
         #expect(PinnedDestinationManager.classifyAppleScriptError(code: 0) != .permissionDenied)
+    }
+}
+
+// MARK: - Pinned Destination: transient-failure retry decision
+
+struct PinnedDestinationRetryDecisionTests {
+    @Test func retriesOnceWhenResultIsAFailureAndDestinationIsStillRunning() async {
+        var attemptCount = 0
+        let result = await PinnedDestinationManager.retryingIfStillRunning(
+            result: "failed",
+            isFailure: { $0 == "failed" },
+            stillRunning: true,
+            attempt: {
+                attemptCount += 1
+                return "ok"
+            }
+        )
+        #expect(result == "ok")
+        #expect(attemptCount == 1)
+    }
+
+    @Test func doesNotRetryWhenTheResultIsAlreadySuccessful() async {
+        var attemptCount = 0
+        let result = await PinnedDestinationManager.retryingIfStillRunning(
+            result: "ok",
+            isFailure: { $0 == "failed" },
+            stillRunning: true,
+            attempt: {
+                attemptCount += 1
+                return "ok"
+            }
+        )
+        #expect(result == "ok")
+        #expect(attemptCount == 0)
+    }
+
+    @Test func doesNotRetryWhenTheDestinationIsConfirmedNotRunning() async {
+        // Retrying a destination that is verifiably gone would only delay reporting a
+        // real failure - see `PinnedDestinationManager.retryingIfStillRunning`.
+        var attemptCount = 0
+        let result = await PinnedDestinationManager.retryingIfStillRunning(
+            result: "failed",
+            isFailure: { $0 == "failed" },
+            stillRunning: false,
+            attempt: {
+                attemptCount += 1
+                return "ok"
+            }
+        )
+        #expect(result == "failed")
+        #expect(attemptCount == 0)
+    }
+
+    @Test func retriedResultIsReturnedEvenIfItIsStillAFailure() async {
+        let result = await PinnedDestinationManager.retryingIfStillRunning(
+            result: "failed",
+            isFailure: { $0 == "failed" },
+            stillRunning: true,
+            attempt: { "failed" }
+        )
+        #expect(result == "failed")
+    }
+}
+
+// MARK: - AppleScript serial executor
+
+struct AppleScriptSerialExecutorTests {
+    // Not a fake/mock of NSAppleScript itself - AppleScript execution cannot be faked
+    // without a live target (see `runAppleScript`'s own doc comment on why this app
+    // must not launch/drive one to develop or test this). This instead proves the
+    // property the serialization exists for: many overlapping callers of the shared
+    // executor are never actually running at the same time, using a plain (racy if
+    // ever actually concurrent) counter as the detector - if the queue were NOT
+    // serial, this would very likely observe an overlap.
+    @Test func concurrentCallsNeverOverlap() async {
+        final class OverlapTracker: @unchecked Sendable {
+            var isRunning = false
+            var overlapDetected = false
+            var completedCount = 0
+        }
+        let tracker = OverlapTracker()
+
+        await withTaskGroup(of: Void.self) { group in
+            for _ in 0..<50 {
+                group.addTask {
+                    await AppleScriptSerialExecutor.run {
+                        if tracker.isRunning {
+                            tracker.overlapDetected = true
+                        }
+                        tracker.isRunning = true
+                        usleep(1000)
+                        tracker.isRunning = false
+                        tracker.completedCount += 1
+                    }
+                }
+            }
+        }
+
+        #expect(!tracker.overlapDetected)
+        #expect(tracker.completedCount == 50)
     }
 }
 
@@ -976,6 +1080,11 @@ struct SettingsBackupPinnedDestinationFieldsTests {
         #expect(decoded.pinnedDestinationEnterRules == nil)
         #expect(decoded.highlightPinnedITermSession == nil)
         #expect(decoded.pinnedITermTintColorHex == nil)
+        #expect(decoded.meetingCaptureShortcut == nil)
+        #expect(decoded.meetingChunkShortcut == nil)
+        #expect(decoded.meetingCaptureShortcuts == nil)
+        #expect(decoded.meetingChunkShortcuts == nil)
+        #expect(decoded.sendMeetingChunksAutomatically == nil)
     }
 
     @Test func newFieldsRoundTripThroughEncodeDecode() throws {
@@ -997,7 +1106,9 @@ struct SettingsBackupPinnedDestinationFieldsTests {
             audioResumptionDelay: nil, isTextFormattingEnabled: nil, autoEnterAfterTranscription: true,
             appendTrailingSpace: false, isExperimentalFeaturesEnabled: nil, restoreClipboardAfterPaste: nil,
             clipboardRestoreDelay: nil, pinDestinationShortcut: nil, pinnedDestinationEnterRules: rules,
-            highlightPinnedITermSession: true, pinnedITermTintColorHex: "112233FF"
+            highlightPinnedITermSession: true, pinnedITermTintColorHex: "112233FF",
+            meetingCaptureShortcut: nil, meetingChunkShortcut: nil,
+            meetingCaptureShortcuts: nil, meetingChunkShortcuts: nil, sendMeetingChunksAutomatically: nil
         )
 
         let data = try JSONEncoder().encode(general)
@@ -1008,5 +1119,406 @@ struct SettingsBackupPinnedDestinationFieldsTests {
         #expect(decoded.highlightPinnedITermSession == true)
         #expect(decoded.pinnedITermTintColorHex == "112233FF")
         #expect(decoded.pinnedDestinationEnterRules == rules)
+    }
+}
+
+// MARK: - Meeting Capture: automatic chunk send trigger (pure policy)
+
+struct MeetingAutoSendPolicyTests {
+    @Test func doesNotSendBeforeTheMinimumSpeechAccumulates() {
+        #expect(
+            MeetingAutoSendPolicy.shouldSend(
+                speechSecondsSinceLastChunk: 3, currentSilenceDuration: 10, secondsSinceLastChunk: 10) == false)
+    }
+
+    @Test func doesNotSendOnEnoughSpeechWithoutATrailingPauseYet() {
+        #expect(
+            MeetingAutoSendPolicy.shouldSend(
+                speechSecondsSinceLastChunk: 25, currentSilenceDuration: 0.5, secondsSinceLastChunk: 26) == false)
+    }
+
+    @Test func sendsOnceEnoughSpeechIsFollowedByTheRequiredPause() {
+        #expect(
+            MeetingAutoSendPolicy.shouldSend(
+                speechSecondsSinceLastChunk: 25, currentSilenceDuration: 1.5, secondsSinceLastChunk: 27) == true)
+    }
+
+    @Test func forcesASendAtTheMaximumWaitEvenWithoutAPause() {
+        #expect(
+            MeetingAutoSendPolicy.shouldSend(
+                speechSecondsSinceLastChunk: 45, currentSilenceDuration: 0, secondsSinceLastChunk: 60) == true)
+    }
+
+    @Test func doesNotSendJustBelowEitherThreshold() {
+        #expect(
+            MeetingAutoSendPolicy.shouldSend(
+                speechSecondsSinceLastChunk: 4.9, currentSilenceDuration: 5, secondsSinceLastChunk: 5) == false)
+        #expect(
+            MeetingAutoSendPolicy.shouldSend(
+                speechSecondsSinceLastChunk: 25, currentSilenceDuration: 1.49, secondsSinceLastChunk: 59.9) == false)
+    }
+}
+
+struct MeetingAutoSendTrackerTests {
+    @Test func recordTickAccumulatesElapsedAndSpeechSeparately() {
+        var tracker = MeetingAutoSendTracker()
+        tracker.recordTick(duration: 2, speechSeconds: 2, silenceDuration: 0)
+        tracker.recordTick(duration: 1, speechSeconds: 0, silenceDuration: 1)
+
+        #expect(tracker.secondsSinceLastChunk == 3)
+        #expect(tracker.speechSecondsSinceLastChunk == 2)
+        #expect(tracker.currentSilenceDuration == 1)
+    }
+
+    @Test func currentSilenceDurationIsSetToTheCallersMeasurementNotAccumulatedFromDurations() {
+        // The caller (MeetingAutoSendEvaluator.step) recomputes silence duration from VAD frame
+        // state each tick rather than summing tick durations, so the tracker must just store
+        // whatever value it's given, not add to a running total of its own - this is what lets
+        // silence be measured at frame resolution instead of whole 1 s ticks.
+        var tracker = MeetingAutoSendTracker()
+        tracker.recordTick(duration: 1, speechSeconds: 0, silenceDuration: 1)
+        tracker.recordTick(duration: 1, speechSeconds: 0, silenceDuration: 2.4)
+
+        #expect(tracker.currentSilenceDuration == 2.4)
+        #expect(tracker.speechSecondsSinceLastChunk == 0)
+        #expect(tracker.secondsSinceLastChunk == 2)
+    }
+
+    @Test func resetAfterChunkSentClearsAllThreeCounters() {
+        var tracker = MeetingAutoSendTracker()
+        tracker.recordTick(duration: 5, speechSeconds: 5, silenceDuration: 0)
+        tracker.resetAfterChunkSent()
+
+        #expect(tracker.speechSecondsSinceLastChunk == 0)
+        #expect(tracker.currentSilenceDuration == 0)
+        #expect(tracker.secondsSinceLastChunk == 0)
+    }
+}
+
+// MARK: - Meeting Capture: automatic chunk send trigger at VAD frame resolution (bug: a pause was
+// only ever seen as ~1 s of silence because it was accounted in whole 1 s drain ticks)
+
+struct MeetingAutoSendEvaluatorFrameResolutionTests {
+    private static let sampleRate = MeetingVAD.sampleRate
+
+    private static func silence(seconds: Double) -> [Int16] {
+        [Int16](repeating: 0, count: Int(seconds * sampleRate))
+    }
+
+    private static func tone(seconds: Double, amplitude: Int16 = 6000, frequency: Double = 400) -> [Int16] {
+        let count = Int(seconds * sampleRate)
+        return (0..<count).map { i in
+            let t = Double(i) / sampleRate
+            return Int16(clamping: Int((Double(amplitude) * sin(2 * Double.pi * frequency * t)).rounded()))
+        }
+    }
+
+    /// Feeds `micStream` through `MeetingAutoSendEvaluator.step` in 1 s ticks - the same interval
+    /// `MeetingAudioCapture`'s drain timer uses - against a silent system channel. Returns the
+    /// elapsed stream time (seconds) at which the first tick triggered, or nil if none did.
+    private static func firstTriggerTime(_ micStream: [Int16]) -> TimeInterval? {
+        let tickSamples = Int(sampleRate)
+        var micState = MeetingVAD.State.initial
+        var systemState = MeetingVAD.State.initial
+        var tracker = MeetingAutoSendTracker()
+        var offset = 0
+        while offset < micStream.count {
+            let end = min(offset + tickSamples, micStream.count)
+            let micTick = Array(micStream[offset..<end])
+            let systemTick = [Int16](repeating: 0, count: micTick.count)
+            let result = MeetingAutoSendEvaluator.step(
+                mic: micTick, system: systemTick, sampleRate: sampleRate, autoSendEnabled: true,
+                micVADState: micState, systemVADState: systemState, tracker: tracker)
+            micState = result.micVADState
+            systemState = result.systemVADState
+            tracker = result.tracker
+            offset = end
+            if result.shouldTrigger { return Double(offset) / sampleRate }
+        }
+        return nil
+    }
+
+    @Test func fiveSecondsOfSpeechFollowedByTheRequiredPauseTriggers() {
+        // 5 s of speech - right at the floor - followed by a pause past the 1.5 s requirement
+        // must trigger, and well before the 60 s cap.
+        let stream = Self.tone(seconds: 5) + Self.silence(seconds: 2.5)
+
+        guard let time = Self.firstTriggerTime(stream) else {
+            Issue.record("expected a trigger during the pause, got none")
+            return
+        }
+        #expect(time > 5, "must not fire before 5 s of speech has accumulated")
+        #expect(time < 10, "must fire during the pause, not wait for the 60 s cap (fired at \(time)s)")
+    }
+
+    @Test func belowTheMinimumSpeechNeverTriggersNaturallyOnlyTheSixtySecondCapCanFireIt() {
+        // 3 s of speech - below the 5 s floor - followed by silence well past the 60 s cap: the
+        // natural trailing-silence trigger never fires (speech never reaches the floor), but the
+        // cap still fires once `secondsSinceLastChunk` reaches 60, because there is something
+        // (the 3 s of speech) to send.
+        let stream = Self.tone(seconds: 3) + Self.silence(seconds: 65)
+
+        guard let time = Self.firstTriggerTime(stream) else {
+            Issue.record("expected the 60 s cap to fire eventually, got no trigger at all")
+            return
+        }
+        #expect(time >= 60, "must not fire before the 60 s cap even though speech never reached the floor")
+    }
+
+    @Test func oneSecondGapsBetweenBurstsNeverTrigger() {
+        // 25 cycles of 1 s speech + 1 s silence: 25 s of speech accumulates (past the 5 s floor)
+        // but no single gap ever reaches the 1.5 s trailing-silence requirement, and the whole
+        // stream stays under the 60 s cap - so this must never trigger.
+        var stream: [Int16] = []
+        for _ in 0..<25 {
+            stream += Self.tone(seconds: 1) + Self.silence(seconds: 1)
+        }
+        #expect(stream.count < Int(60 * Self.sampleRate))
+
+        #expect(Self.firstTriggerTime(stream) == nil)
+    }
+}
+
+// MARK: - Shortcuts: multiple bindings per action, storage round trip and backward compatibility
+
+struct ShortcutStoreMultipleBindingsTests {
+    // A fresh UUID-parameterized `.mode` action per test is scratch storage that no real code
+    // path (or `ShortcutValidator`'s conflict scan, which only walks known actions) ever looks
+    // at, so tests need no shared fixture - just their own cleanup.
+    private func scratchAction() -> ShortcutAction { .mode(UUID()) }
+
+    @Test func aFreshActionHasNoBindings() {
+        let action = scratchAction()
+        defer { ShortcutStore.removeShortcutStorage(for: action) }
+
+        #expect(ShortcutStore.shortcuts(for: action).isEmpty)
+    }
+
+    @Test func setShortcutsStoresAllBindingsAndEachIndexReadsBack() {
+        let action = scratchAction()
+        defer { ShortcutStore.removeShortcutStorage(for: action) }
+
+        let first = Shortcut.key(keyCode: 210, modifierFlags: [.control, .shift])
+        let second = Shortcut.key(keyCode: 211, modifierFlags: [.control, .shift])
+        ShortcutStore.setShortcuts([first, second], for: action)
+
+        #expect(ShortcutStore.shortcuts(for: action) == [first, second])
+        #expect(ShortcutStore.shortcut(for: action, at: 0) == first)
+        #expect(ShortcutStore.shortcut(for: action, at: 1) == second)
+        #expect(ShortcutStore.shortcut(for: action, at: 2) == nil)
+    }
+
+    @Test func setShortcutAtAnIndexOnePastTheEndAppendsRatherThanBeingDropped() {
+        let action = scratchAction()
+        defer { ShortcutStore.removeShortcutStorage(for: action) }
+
+        let first = Shortcut.key(keyCode: 210, modifierFlags: [.control, .shift])
+        ShortcutStore.setShortcut(first, for: action, at: 0)
+        let second = Shortcut.key(keyCode: 211, modifierFlags: [.control, .shift])
+        ShortcutStore.setShortcut(second, for: action, at: 1)
+
+        #expect(ShortcutStore.shortcuts(for: action) == [first, second])
+    }
+
+    @Test func removeShortcutDropsOnlyThatIndexAndShiftsTheRestDown() {
+        let action = scratchAction()
+        defer { ShortcutStore.removeShortcutStorage(for: action) }
+
+        let first = Shortcut.key(keyCode: 210, modifierFlags: [.control, .shift])
+        let second = Shortcut.key(keyCode: 211, modifierFlags: [.control, .shift])
+        let third = Shortcut.key(keyCode: 212, modifierFlags: [.control, .shift])
+        ShortcutStore.setShortcuts([first, second, third], for: action)
+
+        ShortcutStore.removeShortcut(at: 1, for: action)
+
+        #expect(ShortcutStore.shortcuts(for: action) == [first, third])
+    }
+
+    @Test func oldSingleShortcutStorageFormatReadsBackAsAOneElementList() throws {
+        // Storage written before an action could have more than one binding is a single
+        // `Shortcut` JSON object, not an array - reading it must not lose that binding.
+        let action = scratchAction()
+        defer { ShortcutStore.removeShortcutStorage(for: action) }
+
+        let legacy = Shortcut.key(keyCode: 213, modifierFlags: [.control, .shift])
+        let data = try JSONEncoder().encode(legacy)
+        UserDefaults.standard.set(data, forKey: action.userDefaultsKey)
+
+        #expect(ShortcutStore.shortcuts(for: action) == [legacy])
+    }
+
+    @Test func settingAnEmptyListClearsStorageSoTheActionReadsAsFullyUnbound() {
+        let action = scratchAction()
+        defer { ShortcutStore.removeShortcutStorage(for: action) }
+
+        ShortcutStore.setShortcut(Shortcut.key(keyCode: 210, modifierFlags: [.control, .shift]), for: action)
+        ShortcutStore.setShortcuts([], for: action)
+
+        #expect(ShortcutStore.shortcuts(for: action).isEmpty)
+        #expect(ShortcutStore.isShortcutCleared(for: action))
+    }
+}
+
+// MARK: - Shortcuts: ShortcutRecorderModel cancel-notification contract
+
+struct ShortcutRecorderModelCancelNotificationTests {
+    // `.mode(UUID())` is scratch storage - see `ShortcutStoreMultipleBindingsTests.scratchAction()`.
+    // `ShortcutRecorderModel` never touches the store here (no key event is ever fed to it), so
+    // cleanup is defensive only.
+    private func scratchAction() -> ShortcutAction { .mode(UUID()) }
+
+    @Test func cancellingAnActiveRecordingInvokesOnCancelOnceAndNeverOnCapture() {
+        let action = scratchAction()
+        defer { ShortcutStore.removeShortcutStorage(for: action) }
+        let model = ShortcutRecorderModel()
+        var cancelCount = 0
+        var captureCount = 0
+
+        model.start(
+            action: action, index: 0,
+            onCapture: { _ in captureCount += 1 },
+            onCancel: { cancelCount += 1 }
+        )
+        model.cancel()
+
+        #expect(cancelCount == 1)
+        #expect(captureCount == 0)
+    }
+
+    @Test func cancellingAnIdleModelDoesNotInvokeOnCancel() {
+        let model = ShortcutRecorderModel()
+
+        // Never started - nothing to cancel out of.
+        model.cancel()
+
+        #expect(!model.isRecording)
+    }
+
+    @Test func startingASecondRecordingCancelsTheFirstOnesOnCancelNotTheSeconds() {
+        let firstAction = scratchAction()
+        let secondAction = scratchAction()
+        defer {
+            ShortcutStore.removeShortcutStorage(for: firstAction)
+            ShortcutStore.removeShortcutStorage(for: secondAction)
+        }
+        let model = ShortcutRecorderModel()
+        var firstCancelCount = 0
+        var secondCancelCount = 0
+
+        model.start(action: firstAction, index: 0, onCapture: { _ in }, onCancel: { firstCancelCount += 1 })
+        model.start(action: secondAction, index: 0, onCapture: { _ in }, onCancel: { secondCancelCount += 1 })
+
+        #expect(firstCancelCount == 1)
+        #expect(secondCancelCount == 0)
+    }
+}
+
+// MARK: - Shortcuts: any-of-several-bindings resolution (pure part of ShortcutMonitor)
+
+struct ShortcutMonitorTransitionResolutionTests {
+    @Test func aKeyBindingTransitionsToKeyDownOnAMatchingPressWhenNotAlreadyDown() {
+        let shortcut = Shortcut.key(keyCode: 10, modifierFlags: [.command])
+        let transition = ShortcutMonitor.transitionForKeyShortcut(
+            shortcut, isDown: false, kind: .keyDown, keyCode: 10, modifierFlags: [.command])
+        #expect(transition == .keyDown)
+    }
+
+    @Test func aKeyBindingTransitionsToKeyUpOnAMatchingRelease() {
+        let shortcut = Shortcut.key(keyCode: 10, modifierFlags: [.command])
+        let transition = ShortcutMonitor.transitionForKeyShortcut(
+            shortcut, isDown: true, kind: .keyUp, keyCode: 10, modifierFlags: [.command])
+        #expect(transition == .keyUp)
+    }
+
+    @Test func aNonMatchingKeyEventIsIgnored() {
+        let shortcut = Shortcut.key(keyCode: 10, modifierFlags: [.command])
+        let transition = ShortcutMonitor.transitionForKeyShortcut(
+            shortcut, isDown: false, kind: .keyDown, keyCode: 11, modifierFlags: [.command])
+        #expect(transition == .none)
+    }
+
+    @Test func anyOneOfSeveralBindingsMatchingIsEnoughToTriggerTheAction() {
+        // Mirrors the monitor's per-binding loop: an action bound to both a keyboard combo and
+        // a modifier-only (mouse-friendly) combo only needs ONE of them to match an incoming
+        // event for the action to fire.
+        let keyboardBinding = Shortcut.key(keyCode: 10, modifierFlags: [.command])
+        let modifierBinding = Shortcut.modifierOnly(keyCode: nil, modifierFlags: [.control, .option])
+
+        // The incoming event only matches the modifier-only binding.
+        let keyboardTransition = ShortcutMonitor.transitionForKeyShortcut(
+            keyboardBinding, isDown: false, kind: .flagsChanged, keyCode: 0, modifierFlags: [.control, .option])
+        let modifierTransition = ShortcutMonitor.transitionForModifierOnlyShortcut(
+            modifierBinding, isDown: false, kind: .flagsChanged, keyCode: 0, modifierFlags: [.control, .option])
+
+        #expect(keyboardTransition == .none)
+        #expect(modifierTransition == .keyDown)
+        #expect([keyboardTransition, modifierTransition].contains(.keyDown))
+    }
+
+    @Test func modifierOnlyBindingReleasesWhenAHeldModifierIsDropped() {
+        let binding = Shortcut.modifierOnly(keyCode: nil, modifierFlags: [.control, .option])
+        let transition = ShortcutMonitor.transitionForModifierOnlyShortcut(
+            binding, isDown: true, kind: .flagsChanged, keyCode: 0, modifierFlags: [.control])
+        #expect(transition == .keyUp)
+    }
+}
+
+// MARK: - Settings backup: meeting-capture shortcuts (multiple bindings) and old-format fallback
+
+struct SettingsBackupMeetingShortcutFieldsTests {
+    private static func generalBackup(
+        meetingCaptureShortcut: ShortcutBackup? = nil,
+        meetingCaptureShortcuts: [ShortcutBackup]? = nil,
+        sendMeetingChunksAutomatically: Bool? = nil
+    ) -> GeneralBackup {
+        GeneralBackup(
+            primaryRecordingShortcut: nil, secondaryRecordingShortcut: nil, pasteLastTranscriptionShortcut: nil,
+            pasteLastEnhancementShortcut: nil, retryLastTranscriptionShortcut: nil, cancelRecorderShortcut: nil,
+            openHistoryWindowShortcut: nil, quickAddToDictionaryShortcut: nil,
+            primaryRecordingShortcutRawValue: nil, secondaryRecordingShortcutRawValue: nil,
+            primaryRecordingShortcutModeRawValue: nil, secondaryRecordingShortcutModeRawValue: nil,
+            isMiddleClickToggleEnabled: nil, middleClickActivationDelay: nil, launchAtLoginEnabled: nil,
+            isMenuBarOnly: nil, recorderType: nil, appAppearancePreference: nil, appLanguagePreference: nil,
+            isTranscriptionCleanupEnabled: nil, transcriptionRetentionMinutes: nil, isAudioCleanupEnabled: nil,
+            audioRetentionPeriod: nil, isSystemMuteEnabled: nil, isPauseMediaEnabled: nil,
+            audioResumptionDelay: nil, isTextFormattingEnabled: nil, autoEnterAfterTranscription: nil,
+            appendTrailingSpace: nil, isExperimentalFeaturesEnabled: nil, restoreClipboardAfterPaste: nil,
+            clipboardRestoreDelay: nil, pinDestinationShortcut: nil, pinnedDestinationEnterRules: nil,
+            highlightPinnedITermSession: nil, pinnedITermTintColorHex: nil,
+            meetingCaptureShortcut: meetingCaptureShortcut, meetingChunkShortcut: nil,
+            meetingCaptureShortcuts: meetingCaptureShortcuts, meetingChunkShortcuts: nil,
+            sendMeetingChunksAutomatically: sendMeetingChunksAutomatically
+        )
+    }
+
+    @Test func multipleBindingsAndTheAutoSendToggleRoundTripThroughEncodeDecode() throws {
+        let first = Shortcut.key(keyCode: 210, modifierFlags: [.control, .shift])
+        let second = Shortcut.modifierOnly(keyCode: nil, modifierFlags: [.control, .option])
+        let general = Self.generalBackup(
+            meetingCaptureShortcut: ShortcutBackup(first),
+            meetingCaptureShortcuts: [ShortcutBackup(first), ShortcutBackup(second)],
+            sendMeetingChunksAutomatically: true
+        )
+
+        let data = try JSONEncoder().encode(general)
+        let decoded = try JSONDecoder().decode(GeneralBackup.self, from: data)
+
+        #expect(decoded.meetingCaptureShortcuts?.map(\.shortcut) == [first, second])
+        #expect(decoded.sendMeetingChunksAutomatically == true)
+    }
+
+    @Test func oldFormatBackupMissingThePluralFieldStillCarriesTheSingleBinding() throws {
+        // A backup written before an action could have more than one shortcut has only the
+        // singular field - the plural one is absent entirely, not `null`. `BackupImporter`
+        // falls back to the singular field in that case, so it must still decode.
+        let legacy = Shortcut.key(keyCode: 214, modifierFlags: [.control, .shift])
+        let shortcutJSON = try #require(String(data: JSONEncoder().encode(legacy), encoding: .utf8))
+        let oldFormatJSON = "{ \"meetingCaptureShortcut\": \(shortcutJSON) }"
+
+        let data = try #require(oldFormatJSON.data(using: .utf8))
+        let decoded = try JSONDecoder().decode(GeneralBackup.self, from: data)
+
+        #expect(decoded.meetingCaptureShortcuts == nil)
+        #expect(decoded.meetingCaptureShortcut?.shortcut == legacy)
     }
 }

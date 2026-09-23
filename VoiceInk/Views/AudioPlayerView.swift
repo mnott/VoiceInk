@@ -647,14 +647,19 @@ struct AudioPlayerView: View {
 
         isRetranscribing = true
         operationFeedback = nil
+        let isMeetingRecording = transcription?.isMeetingRecording ?? false
 
         Task {
             do {
-                let result = try await transcriptionService.retranscribeAudio(
-                    from: url,
-                    using: transcriptionConfiguration.model,
-                    mode: selectedMode
-                )
+                let result =
+                    isMeetingRecording
+                    ? try await transcriptionService.retranscribeMeetingAudio(
+                        from: url, using: transcriptionConfiguration.model)
+                    : try await transcriptionService.retranscribeAudio(
+                        from: url,
+                        using: transcriptionConfiguration.model,
+                        mode: selectedMode
+                    )
                 await MainActor.run {
                     isRetranscribing = false
                     if let enhancementFailure = result.enhancementFailure {

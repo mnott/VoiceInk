@@ -90,7 +90,7 @@ class CursorPaster {
     @MainActor
     private static func postPasteCommand() async -> PasteResult {
         if PasteMethod.current() == .appleScript {
-            return pasteUsingAppleScript() ? .commandPosted : .commandNotPosted
+            return await pasteUsingAppleScript() ? .commandPosted : .commandNotPosted
         } else {
             return await pasteFromClipboard()
         }
@@ -162,19 +162,26 @@ class CursorPaster {
         return (Unmanaged<CFString>.fromOpaque(nameRef).takeUnretainedValue() as String).hasSuffix("⌘")
     }
 
+    // Routed through `AppleScriptSerialExecutor`, same as every other NSAppleScript
+    // execution in the app: NSAppleScript is not thread-safe, and this can otherwise
+    // run concurrently with pinned-destination delivery's own AppleScript calls (a
+    // different feature, but the same process-wide risk) - see the doc comment on
+    // `AppleScriptSerialExecutor`.
     @MainActor
-    private static func pasteUsingAppleScript() -> Bool {
+    private static func pasteUsingAppleScript() async -> Bool {
         guard let script = layoutSwitchesToQWERTYOnCommand ? pasteScriptKeyCode : pasteScriptKeystroke else {
             logger.error("AppleScript paste script is unavailable")
             return false
         }
 
-        var error: NSDictionary?
-        script.executeAndReturnError(&error)
-        if let error {
-            logger.error("AppleScript paste failed: \(String(describing: error), privacy: .public)")
+        return await AppleScriptSerialExecutor.run {
+            var error: NSDictionary?
+            script.executeAndReturnError(&error)
+            if let error {
+                logger.error("AppleScript paste failed: \(String(describing: error), privacy: .public)")
+            }
+            return error == nil
         }
-        return error == nil
     }
 
     // MARK: - CGEvent paste

@@ -58,11 +58,12 @@ class ModeShortcutManager {
     }
 
     private func refreshModeShortcuts() {
-        let shortcuts = ModeManager.shared.enabledConfigurations.reduce(into: [ShortcutAction: Shortcut]()) {
+        let shortcuts = ModeManager.shared.enabledConfigurations.reduce(into: [ShortcutAction: [Shortcut]]()) {
             result, config in
             let action = ShortcutAction.mode(config.id)
-            if let shortcut = ShortcutStore.shortcut(for: action) {
-                result[action] = shortcut
+            let bindings = ShortcutStore.shortcuts(for: action)
+            if !bindings.isEmpty {
+                result[action] = bindings
             }
         }
 

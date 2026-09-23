@@ -69,11 +69,7 @@ enum ShortcutValidator {
         -> ShortcutAction?
     {
         for action in allStoredActions where action != actionToIgnore {
-            guard let existingShortcut = ShortcutStore.shortcut(for: action) else {
-                continue
-            }
-
-            if existingShortcut.conflicts(with: candidate) {
+            if ShortcutStore.shortcuts(for: action).contains(where: { $0.conflicts(with: candidate) }) {
                 return action
             }
         }

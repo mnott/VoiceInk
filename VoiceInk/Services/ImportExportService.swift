@@ -109,6 +109,11 @@ class ImportExportService {
 
     private let keyIsTextFormattingEnabled = "IsTextFormattingEnabled"
 
+    private static func shortcutBackups(for action: ShortcutAction) -> [ShortcutBackup]? {
+        let bindings = ShortcutStore.shortcuts(for: action).map(ShortcutBackup.init)
+        return bindings.isEmpty ? nil : bindings
+    }
+
     private init() {
         if let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
             self.currentSettingsVersion = version
@@ -198,7 +203,16 @@ class ImportExportService {
             highlightPinnedITermSession: UserDefaults.standard.bool(
                 forKey: PinnedDestinationSettingsKeys.highlightPinnedITermSession),
             pinnedITermTintColorHex: UserDefaults.standard.string(
-                forKey: PinnedDestinationSettingsKeys.pinnedITermTintColorHex)
+                forKey: PinnedDestinationSettingsKeys.pinnedITermTintColorHex),
+
+            meetingCaptureShortcut: ShortcutStore.shortcut(for: .meetingCapture).map(ShortcutBackup.init),
+            meetingChunkShortcut: ShortcutStore.shortcut(for: .meetingChunk).map(ShortcutBackup.init),
+
+            meetingCaptureShortcuts: Self.shortcutBackups(for: .meetingCapture),
+            meetingChunkShortcuts: Self.shortcutBackups(for: .meetingChunk),
+
+            sendMeetingChunksAutomatically: UserDefaults.standard.bool(
+                forKey: PinnedDestinationSettingsKeys.sendMeetingChunksAutomatically)
         )
 
         let exportedSettings = BackupFile(

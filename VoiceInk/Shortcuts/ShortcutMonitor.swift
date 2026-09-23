@@ -4,7 +4,7 @@ import Foundation
 import os
 
 final class ShortcutMonitor {
-    fileprivate enum EventKind {
+    enum EventKind {
         case keyDown
         case keyUp
         case flagsChanged
@@ -17,7 +17,12 @@ final class ShortcutMonitor {
         var isInterrupted = false
     }
 
-    private var shortcuts: [ShortcutAction: ShortcutState] = [:]
+    /// Each action maps to all of its bound shortcuts (0..n) - see `ShortcutStore`. Any binding
+    /// transitioning to key-down/key-up dispatches for the action; a second binding's key-down
+    /// while the action is already considered "down" is naturally absorbed by callers' own
+    /// re-entrancy guards (e.g. `RecordingShortcutModeHandler.handleKeyDown`'s `isShortcutPressed`
+    /// check), so no extra dedup lives here.
+    private var shortcuts: [ShortcutAction: [ShortcutState]] = [:]
     private var interruptibleActions: Set<ShortcutAction> = []
     private var onKeyDown: ((ShortcutAction, TimeInterval) -> Void)?
     private var onKeyUp: ((ShortcutAction, TimeInterval) -> Void)?
@@ -40,7 +45,7 @@ final class ShortcutMonitor {
 
     @discardableResult
     func start(
-        shortcuts: [ShortcutAction: Shortcut],
+        shortcuts: [ShortcutAction: [Shortcut]],
         interruptibleActions: Set<ShortcutAction> = [],
         onKeyDown: @escaping (ShortcutAction, TimeInterval) -> Void,
         onKeyUp: @escaping (ShortcutAction, TimeInterval) -> Void,
@@ -49,8 +54,8 @@ final class ShortcutMonitor {
         stop()
 
         stateLock.lock()
-        for (action, shortcut) in shortcuts {
-            self.shortcuts[action] = ShortcutState(shortcut: shortcut)
+        for (action, actionShortcuts) in shortcuts where !actionShortcuts.isEmpty {
+            self.shortcuts[action] = actionShortcuts.map { ShortcutState(shortcut: $0) }
         }
 
         let isEmpty = self.shortcuts.isEmpty
@@ -196,8 +201,8 @@ final class ShortcutMonitor {
         defer { stateLock.unlock() }
 
         let eventTime = ProcessInfo.processInfo.systemUptime
-        let pressedActions = shortcuts.compactMap { action, state in
-            state.isDown ? action : nil
+        let pressedActions = shortcuts.compactMap { action, states in
+            states.contains { $0.isDown } ? action : nil
         }
 
         guard !pressedActions.isEmpty else {
@@ -205,11 +210,14 @@ final class ShortcutMonitor {
         }
 
         for action in pressedActions {
-            if var state = shortcuts[action] {
-                state.isDown = false
-                state.pressedAt = nil
-                state.isInterrupted = false
-                shortcuts[action] = state
+            shortcuts[action] = shortcuts[action]?.map { state in
+                var state = state
+                if state.isDown {
+                    state.isDown = false
+                    state.pressedAt = nil
+                    state.isInterrupted = false
+                }
+                return state
             }
             dispatchKeyUp(for: action, eventTime: eventTime)
         }
@@ -234,63 +242,67 @@ final class ShortcutMonitor {
         }
 
         for action in Array(shortcuts.keys) {
-            guard var state = shortcuts[action] else {
+            guard var states = shortcuts[action] else {
                 continue
             }
 
-            if state.shortcut.isModifierOnly {
-                handleModifierOnlyShortcut(
-                    action: action,
-                    state: state,
-                    kind: kind,
-                    keyCode: keyCode,
-                    modifierFlags: modifierFlags,
-                    eventTime: eventTime
-                )
-                continue
+            for index in states.indices {
+                let state = states[index]
+
+                // Modifier-only shortcuts (e.g. a lone Right ⌘) never suppress the underlying
+                // flags-changed event - only key-type shortcuts do, since suppressing a
+                // modifier key's event would also swallow it for every other app.
+                let transition: ShortcutTransition
+                let suppressesOnTrigger: Bool
+                if state.shortcut.isModifierOnly {
+                    transition = Self.transitionForModifierOnlyShortcut(
+                        state.shortcut, isDown: state.isDown, kind: kind, keyCode: keyCode,
+                        modifierFlags: modifierFlags)
+                    suppressesOnTrigger = false
+                } else {
+                    transition = Self.transitionForKeyShortcut(
+                        state.shortcut, isDown: state.isDown, kind: kind, keyCode: keyCode,
+                        modifierFlags: modifierFlags)
+                    suppressesOnTrigger = true
+                }
+
+                switch transition {
+                case .none:
+                    break
+                case .suppress:
+                    shouldSuppress = true
+                case .keyDown:
+                    states[index].isDown = true
+                    states[index].pressedAt = eventTime
+                    states[index].isInterrupted = false
+                    if suppressesOnTrigger { shouldSuppress = true }
+                    dispatchKeyDown(for: action, eventTime: eventTime)
+                case .keyUp:
+                    states[index].isDown = false
+                    states[index].pressedAt = nil
+                    states[index].isInterrupted = false
+                    if suppressesOnTrigger { shouldSuppress = true }
+                    dispatchKeyUp(for: action, eventTime: eventTime)
+                }
             }
 
-            let transition = transitionForKeyShortcut(
-                state.shortcut,
-                isDown: state.isDown,
-                kind: kind,
-                keyCode: keyCode,
-                modifierFlags: modifierFlags
-            )
-
-            switch transition {
-            case .none:
-                break
-            case .suppress:
-                shouldSuppress = true
-            case .keyDown:
-                state.isDown = true
-                state.pressedAt = eventTime
-                state.isInterrupted = false
-                shortcuts[action] = state
-                shouldSuppress = true
-                dispatchKeyDown(for: action, eventTime: eventTime)
-            case .keyUp:
-                state.isDown = false
-                state.pressedAt = nil
-                state.isInterrupted = false
-                shortcuts[action] = state
-                shouldSuppress = true
-                dispatchKeyUp(for: action, eventTime: eventTime)
-            }
+            shortcuts[action] = states
         }
 
         return shouldSuppress
     }
 
-    private enum ShortcutTransition {
+    enum ShortcutTransition: Equatable {
         case none
         case suppress
         case keyDown
         case keyUp
     }
 
-    private func transitionForKeyShortcut(
+    /// Pure: given one binding's current down/up state and an incoming event, what should happen
+    /// to it. Kept static (no `self`) so the "does any binding of an action trigger" resolution
+    /// is directly unit-testable without standing up the event tap.
+    static func transitionForKeyShortcut(
         _ shortcut: Shortcut,
         isDown: Bool,
         kind: EventKind,
@@ -319,39 +331,23 @@ final class ShortcutMonitor {
         }
     }
 
-    private func handleModifierOnlyShortcut(
-        action: ShortcutAction,
-        state: ShortcutState,
+    static func transitionForModifierOnlyShortcut(
+        _ shortcut: Shortcut,
+        isDown: Bool,
         kind: EventKind,
         keyCode: UInt16,
-        modifierFlags: NSEvent.ModifierFlags,
-        eventTime: TimeInterval
-    ) {
-        var state = state
-
+        modifierFlags: NSEvent.ModifierFlags
+    ) -> ShortcutTransition {
         guard kind == .flagsChanged else {
-            return
+            return .none
         }
 
-        if state.isDown {
-            if state.shortcut.shouldReleaseModifierEvent(keyCode: keyCode, modifierFlags: modifierFlags) {
-                state.isDown = false
-                state.pressedAt = nil
-                state.isInterrupted = false
-                shortcuts[action] = state
-                dispatchKeyUp(for: action, eventTime: eventTime)
-            }
-
-            return
+        if isDown {
+            return shortcut.shouldReleaseModifierEvent(keyCode: keyCode, modifierFlags: modifierFlags)
+                ? .keyUp : .none
         }
 
-        if state.shortcut.matchesModifierEvent(keyCode: keyCode, modifierFlags: modifierFlags) {
-            state.isDown = true
-            state.pressedAt = eventTime
-            state.isInterrupted = false
-            shortcuts[action] = state
-            dispatchKeyDown(for: action, eventTime: eventTime)
-        }
+        return shortcut.matchesModifierEvent(keyCode: keyCode, modifierFlags: modifierFlags) ? .keyDown : .none
     }
 
     private func handleShortcutInterruptions(keyCode: UInt16, eventTime: TimeInterval) {
@@ -360,19 +356,26 @@ final class ShortcutMonitor {
         }
 
         for action in interruptibleActions {
-            guard var state = shortcuts[action],
-                state.isDown,
-                !state.isInterrupted,
-                let pressedAt = state.pressedAt,
-                eventTime - pressedAt <= Self.shortcutInterruptionWindow,
-                state.shortcut.isInterruptedByAdditionalKeyDown(keyCode: keyCode)
-            else {
+            guard var states = shortcuts[action] else {
                 continue
             }
 
-            state.isInterrupted = true
-            shortcuts[action] = state
-            dispatchShortcutInterrupted(for: action, eventTime: eventTime)
+            for index in states.indices {
+                let state = states[index]
+                guard state.isDown,
+                    !state.isInterrupted,
+                    let pressedAt = state.pressedAt,
+                    eventTime - pressedAt <= Self.shortcutInterruptionWindow,
+                    state.shortcut.isInterruptedByAdditionalKeyDown(keyCode: keyCode)
+                else {
+                    continue
+                }
+
+                states[index].isInterrupted = true
+                dispatchShortcutInterrupted(for: action, eventTime: eventTime)
+            }
+
+            shortcuts[action] = states
         }
     }
 

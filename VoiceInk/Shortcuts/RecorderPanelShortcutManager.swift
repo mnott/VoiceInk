@@ -72,15 +72,17 @@ final class RecorderPanelShortcutManager: ObservableObject {
         var shortcuts = ShortcutStore.shortcuts(for: ShortcutAction.recorderPanelStoredActions)
 
         if ShortcutStore.shortcut(for: .cancelRecorder) == nil {
-            shortcuts[.recorderPanelEscape] = .key(keyCode: UInt16(kVK_Escape), modifierFlags: [])
+            shortcuts[.recorderPanelEscape] = [.key(keyCode: UInt16(kVK_Escape), modifierFlags: [])]
         }
 
         if canUseModeShortcuts {
             for (index, keyCode) in Self.digitKeyCodes.enumerated() {
-                shortcuts[.recorderPanelMode(index)] = .key(
-                    keyCode: keyCode,
-                    modifierFlags: [.option]
-                )
+                shortcuts[.recorderPanelMode(index)] = [
+                    .key(
+                        keyCode: keyCode,
+                        modifierFlags: [.option]
+                    )
+                ]
             }
         }
 

@@ -15,6 +15,14 @@ struct PinnedDestinationSettingsSection: View {
     @AppStorage(PinnedDestinationSettingsKeys.pinnedITermTintColorHex)
     private var pinnedITermTintColorHex = PinnedDestinationManager.hexString(
         fromITermColor: PinnedDestinationManager.defaultPinnedBackgroundColor)
+    @AppStorage(PinnedDestinationSettingsKeys.sendMeetingChunksAutomatically)
+    private var sendMeetingChunksAutomatically = false
+
+    @State private var meetingShortcutBindingCounts: [ShortcutAction: Int] = [
+        .meetingCapture: ShortcutStore.shortcuts(for: .meetingCapture).count,
+        .meetingChunk: ShortcutStore.shortcuts(for: .meetingChunk).count,
+    ]
+    @State private var pendingMeetingShortcutSlots: [ShortcutAction: Int] = [:]
 
     /// Reads/writes the tint color AND opacity preference through SwiftUI's `Color`, going via
     /// `NSColor`'s sRGB representation rather than any other color space - `ColorPicker`'s
@@ -221,7 +229,89 @@ struct PinnedDestinationSettingsSection: View {
                 .font(.caption)
                 .foregroundColor(.secondary)
             }
+
+            Section {
+                meetingShortcutRow(action: .meetingCapture, title: "Toggle Meeting Capture")
+                meetingShortcutRow(action: .meetingChunk, title: "Send Meeting Chunk")
+
+                Toggle("Send Chunks Automatically", isOn: $sendMeetingChunksAutomatically)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .help(
+                        "While Meeting Capture is running, automatically send a chunk at a natural pause instead of waiting for the Send Meeting Chunk shortcut. The shortcut keeps working and resets the timing."
+                    )
+            } header: {
+                Text("Meeting Capture")
+            } footer: {
+                Text(
+                    "Records the microphone and everything your Mac plays - the other participants in a Teams/Zoom call, for example - without muting or pausing the call. Each press of Send Meeting Chunk transcribes the audio captured since the last press and delivers it to the pinned destination (or the cursor) while recording keeps running. macOS asks once for System Audio Recording permission the first time you use this. Echo cancellation removes what the speakers played back out of the microphone recording, so the other participants are not captured twice even without headphones. Either action can have more than one shortcut - useful for pairing a keyboard combo with a mouse button combo."
+                )
+                .font(.caption)
+                .foregroundColor(.secondary)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: ShortcutStore.shortcutDidChange)) { notification in
+                guard let action = notification.object as? ShortcutAction,
+                    action == .meetingCapture || action == .meetingChunk
+                else {
+                    return
+                }
+                refreshMeetingShortcutBindingCount(for: action)
+            }
         }
+    }
+
+    private func meetingShortcutRow(action: ShortcutAction, title: LocalizedStringKey) -> some View {
+        let boundCount = meetingShortcutBindingCounts[action, default: 0]
+        let rowCount = max(1, boundCount + pendingMeetingShortcutSlots[action, default: 0])
+
+        func collapsePendingSlot(forIndex index: Int) {
+            guard index >= boundCount else { return }
+            pendingMeetingShortcutSlots[action, default: 0] =
+                max(0, pendingMeetingShortcutSlots[action, default: 0] - 1)
+        }
+
+        return LabeledContent(title) {
+            VStack(alignment: .trailing, spacing: 6) {
+                ForEach(0..<rowCount, id: \.self) { index in
+                    HStack(spacing: 8) {
+                        ShortcutRecorder(
+                            action: action,
+                            index: index,
+                            onCancel: {
+                                collapsePendingSlot(forIndex: index)
+                            }
+                        ) {
+                            refreshMeetingShortcutBindingCount(for: action)
+                            collapsePendingSlot(forIndex: index)
+                        }
+                        .controlSize(.small)
+
+                        Button {
+                            if index < boundCount {
+                                ShortcutStore.removeShortcut(at: index, for: action)
+                                refreshMeetingShortcutBindingCount(for: action)
+                            } else {
+                                collapsePendingSlot(forIndex: index)
+                            }
+                        } label: {
+                            Image(systemName: "minus.circle.fill")
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Remove this shortcut")
+                    }
+                }
+
+                Button("Add Shortcut") {
+                    pendingMeetingShortcutSlots[action, default: 0] += 1
+                }
+                .controlSize(.small)
+            }
+        }
+    }
+
+    private func refreshMeetingShortcutBindingCount(for action: ShortcutAction) {
+        meetingShortcutBindingCounts[action] = ShortcutStore.shortcuts(for: action).count
     }
 
     private func isCustomizedAwayFromDefaults(_ rule: PinnedDestinationEnterRule) -> Bool {

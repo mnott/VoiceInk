@@ -4,7 +4,11 @@ import SwiftUI
 
 struct ShortcutRecorder: View {
     let action: ShortcutAction
+    /// Which of the action's 0..n bindings (see `ShortcutStore`) this recorder edits. Actions
+    /// with a single-recorder UI always use the default of 0 - their first (and only) binding.
+    let index: Int
     let defaultShortcut: Shortcut?
+    let onCancel: () -> Void
     let onShortcutChanged: () -> Void
 
     @StateObject private var recorder = ShortcutRecorderModel()
@@ -13,13 +17,17 @@ struct ShortcutRecorder: View {
 
     init(
         action: ShortcutAction,
+        index: Int = 0,
         defaultShortcut: Shortcut? = nil,
+        onCancel: @escaping () -> Void = {},
         onShortcutChanged: @escaping () -> Void = {}
     ) {
         self.action = action
+        self.index = index
         self.defaultShortcut = defaultShortcut
+        self.onCancel = onCancel
         self.onShortcutChanged = onShortcutChanged
-        _shortcut = State(initialValue: ShortcutStore.shortcut(for: action))
+        _shortcut = State(initialValue: ShortcutStore.shortcut(for: action, at: index))
     }
 
     var body: some View {
@@ -33,10 +41,15 @@ struct ShortcutRecorder: View {
                         object: recorderID
                     )
                     clearShortcutBeforeRecording()
-                    recorder.start(action: action) { newShortcut in
-                        shortcut = newShortcut
-                        onShortcutChanged()
-                    }
+                    recorder.start(
+                        action: action,
+                        index: index,
+                        onCapture: { newShortcut in
+                            shortcut = newShortcut
+                            onShortcutChanged()
+                        },
+                        onCancel: onCancel
+                    )
                 }
             } label: {
                 ShortcutVisualization(
@@ -51,7 +64,7 @@ struct ShortcutRecorder: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: ShortcutStore.shortcutDidChange)) { notification in
             guard let changedAction = notification.object as? ShortcutAction, changedAction == action else { return }
-            shortcut = ShortcutStore.shortcut(for: action)
+            shortcut = ShortcutStore.shortcut(for: action, at: index)
         }
         .onReceive(NotificationCenter.default.publisher(for: Self.shortcutRecordingDidStart)) { notification in
             guard let activeRecorderID = notification.object as? UUID, activeRecorderID != recorderID else { return }
@@ -60,7 +73,7 @@ struct ShortcutRecorder: View {
         .onChange(of: action) { _, newAction in
             recorder.cancel()
             recorderID = UUID()
-            shortcut = ShortcutStore.shortcut(for: newAction)
+            shortcut = ShortcutStore.shortcut(for: newAction, at: index)
         }
         .onDisappear {
             recorder.cancel()
@@ -84,9 +97,8 @@ struct ShortcutRecorder: View {
     }
 
     private func clearShortcutBeforeRecording() {
-        ShortcutStore.setShortcut(nil, for: action)
+        ShortcutStore.removeShortcut(at: index, for: action)
         shortcut = nil
-        onShortcutChanged()
     }
 
     private static let shortcutRecordingDidStart = Notification.Name("ShortcutRecorderRecordingDidStart")
@@ -165,7 +177,9 @@ final class ShortcutRecorderModel: ObservableObject {
 
     private var localMonitor: Any?
     private var onCapture: ((Shortcut) -> Void)?
+    private var onCancel: (() -> Void)?
     private var activeAction: ShortcutAction?
+    private var activeIndex: Int = 0
     private var pendingModifierShortcut: Shortcut?
     private var peakModifierFlags: NSEvent.ModifierFlags = []
 
@@ -173,19 +187,31 @@ final class ShortcutRecorderModel: ObservableObject {
         removeRecordingMonitor()
     }
 
-    func start(action: ShortcutAction, onCapture: @escaping (Shortcut) -> Void) {
+    func start(
+        action: ShortcutAction,
+        index: Int = 0,
+        onCapture: @escaping (Shortcut) -> Void,
+        onCancel: (() -> Void)? = nil
+    ) {
         cancel()
 
         activeAction = action
+        activeIndex = index
         self.onCapture = onCapture
+        self.onCancel = onCancel
         isRecording = true
         previewShortcut = nil
         installRecordingMonitor()
     }
 
     func cancel() {
+        let wasRecording = isRecording
+        let cancelHandler = onCancel
         removeRecordingMonitor()
         resetRecordingState()
+        if wasRecording {
+            cancelHandler?()
+        }
     }
 
     private func finish(with shortcut: Shortcut) {
@@ -201,10 +227,11 @@ final class ShortcutRecorderModel: ObservableObject {
         }
 
         let capture = onCapture
+        let index = activeIndex
         removeRecordingMonitor()
         resetRecordingState()
 
-        ShortcutStore.setShortcut(shortcut, for: activeAction)
+        ShortcutStore.setShortcut(shortcut, for: activeAction, at: index)
         capture?(shortcut)
     }
 
@@ -212,7 +239,9 @@ final class ShortcutRecorderModel: ObservableObject {
         isRecording = false
         previewShortcut = nil
         onCapture = nil
+        onCancel = nil
         activeAction = nil
+        activeIndex = 0
         pendingModifierShortcut = nil
         peakModifierFlags = []
     }

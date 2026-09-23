@@ -211,12 +211,12 @@ class RecordingShortcutManager: ObservableObject {
         var interruptibleRecordingActions = Set<ShortcutAction>()
 
         if let primaryShortcut {
-            shortcuts[.primaryRecording] = primaryShortcut
+            shortcuts[.primaryRecording] = [primaryShortcut]
             interruptibleRecordingActions.insert(.primaryRecording)
         }
 
         if let secondaryShortcut {
-            shortcuts[.secondaryRecording] = secondaryShortcut
+            shortcuts[.secondaryRecording] = [secondaryShortcut]
             interruptibleRecordingActions.insert(.secondaryRecording)
         }
 
@@ -290,6 +290,10 @@ class RecordingShortcutManager: ObservableObject {
             DictionaryQuickAddManager.shared.toggle(modelContainer: engine.modelContext.container)
         case .pinDestination:
             await PinnedDestinationManager.shared.toggle()
+        case .meetingCapture:
+            engine.toggleMeetingCapture()
+        case .meetingChunk:
+            engine.sendMeetingChunk()
         default:
             break
         }

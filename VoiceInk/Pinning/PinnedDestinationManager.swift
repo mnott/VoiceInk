@@ -130,7 +130,8 @@ final class PinnedDestinationManager: ObservableObject {
     /// Outcome of trying to deliver to the stored pinned target: the cached AXUIElement
     /// may still be usable (fast path), or it may need re-resolving inside its owning
     /// app, or that re-resolution may fail in one of two importantly different ways -
-    /// the app itself is gone (a real "the pin is dead" case), versus the app being
+    /// the app itself is gone (a real "the destination is confirmed gone" case - see
+    /// `reportGone`, which still leaves the pin itself in place), versus the app being
     /// alive but nothing currently focused there (transient - the pin stays intact).
     enum AXDeliveryResolution: Equatable {
         case useCachedElement
@@ -422,28 +423,32 @@ final class PinnedDestinationManager: ObservableObject {
     // MARK: - Delivery
 
     /// Delivers `text` to the pinned destination, if any. Verifies liveness first;
-    /// if the destination is confirmed gone, clears the pin, notifies the user that
-    /// delivery did NOT happen, and returns false. If VoiceInk lacks Automation
-    /// permission to even ask, the pin is left untouched - that is not evidence the
-    /// destination is gone, see the "iTerm2 delivery" section below. Never fails
-    /// silently, since by definition the user is looking elsewhere while this runs.
+    /// the pin is NEVER cleared here - only an explicit user unpin does that (see
+    /// `unpin(notify:)`) - regardless of the outcome. If the destination is confirmed
+    /// gone, or delivery otherwise fails, the text is copied to the clipboard and the
+    /// user is notified that delivery did NOT happen; the pin stays so a later attempt
+    /// (the destination coming back, or the user fixing whatever blocked delivery) can
+    /// still use it. If VoiceInk lacks Automation permission to even ask, that is not
+    /// evidence the destination is gone either, see the "iTerm2 delivery" section
+    /// below. Never fails silently, since by definition the user is looking elsewhere
+    /// while this runs.
     @discardableResult
-    func deliver(text: String) async -> Bool {
+    func deliver(text: String, playSound: Bool = true) async -> Bool {
         guard let target = pinned else { return false }
 
         switch target {
         case .iTermSession(let id, _, _):
             switch await iTermSessionLiveness(id: id) {
             case .success(let status) where status == "alive":
-                return await finishDelivery(to: target, rawText: text)
+                return await finishDelivery(to: target, rawText: text, playSound: playSound)
             case .success:
-                reportGone(target)
+                reportGone(target, text: text, playSound: playSound)
                 return false
             case .permissionDenied:
-                reportPermissionDenied(destinationLabel: target.displayLabel)
+                reportPermissionDenied(destinationLabel: target.displayLabel, text: text, playSound: playSound)
                 return false
             case .failed:
-                reportGone(target)
+                reportGone(target, text: text, playSound: playSound)
                 return false
             }
 
@@ -460,7 +465,7 @@ final class PinnedDestinationManager: ObservableObject {
                 reResolvedElementPresent: reResolved != nil
             ) {
             case .useCachedElement:
-                return await finishDelivery(to: target, rawText: text)
+                return await finishDelivery(to: target, rawText: text, playSound: playSound)
 
             case .useReResolvedElement:
                 guard let reResolved else { return false }
@@ -468,18 +473,20 @@ final class PinnedDestinationManager: ObservableObject {
                     element: reResolved, appName: appName, bundleID: bundleID, pid: pid, windowTitle: windowTitle)
                 // Cache the freshly resolved element so the next delivery can use the fast path again.
                 pinned = reResolvedTarget
-                return await finishDelivery(to: reResolvedTarget, rawText: text)
+                return await finishDelivery(to: reResolvedTarget, rawText: text, playSound: playSound)
 
             case .reportGone:
-                reportGone(target)
+                reportGone(target, text: text, playSound: playSound)
                 return false
 
             case .reportNothingFocused:
                 // The app is still there, just not focused on anything right now - unlike
                 // "gone", this is transient, so the pin itself is left untouched.
+                copyFailedDeliveryToClipboard(text)
                 NotificationManager.shared.showNotification(
                     title: String(
-                        format: String(localized: "Nothing is focused in %@ right now. Text was not delivered."),
+                        format: String(
+                            localized: "Nothing is focused in %@ right now. The text was copied to the clipboard."),
                         appName),
                     type: .warning
                 )
@@ -494,14 +501,14 @@ final class PinnedDestinationManager: ObservableObject {
             // focus on internally. The only thing worth checking first is whether that process
             // still exists at all.
             guard isAppAlive(pid: pid) else {
-                reportGone(target)
+                reportGone(target, text: text, playSound: playSound)
                 return false
             }
-            return await finishDelivery(to: target, rawText: text)
+            return await finishDelivery(to: target, rawText: text, playSound: playSound)
         }
     }
 
-    private func finishDelivery(to target: PinnedTarget, rawText: String) async -> Bool {
+    private func finishDelivery(to target: PinnedTarget, rawText: String, playSound: Bool) async -> Bool {
         let rules = PinnedDestinationEnterRulesManager.shared
         let appendReturn = rules.appendReturn(forBundleIdentifier: target.bundleIdentifier)
         let text = PinnedDestinationEnterRuleStore.deliveredText(
@@ -537,18 +544,18 @@ final class PinnedDestinationManager: ObservableObject {
                 reportDeliveredWithoutSubmission(target)
                 return true
             case .gone:
-                reportGone(target)
+                reportGone(target, text: rawText, playSound: playSound)
                 return false
             case .permissionDenied:
-                reportPermissionDenied(destinationLabel: target.displayLabel)
+                reportPermissionDenied(destinationLabel: target.displayLabel, text: rawText, playSound: playSound)
                 return false
             case .failed:
-                reportDeliveryFailed(target)
+                reportDeliveryFailed(target, text: rawText, playSound: playSound)
                 return false
             }
 
         case .axElement(let element, _, _, let pid, _):
-            switch deliverToAXElement(element: element, pid: pid, text: text, appendReturn: appendReturn) {
+            switch await deliverToAXElement(element: element, pid: pid, text: text, appendReturn: appendReturn) {
             case .delivered:
                 return true
             case .deliveredWithoutSubmission:
@@ -558,7 +565,7 @@ final class PinnedDestinationManager: ObservableObject {
                 reportDeliveredWithoutSubmission(target)
                 return true
             case .writeFailed:
-                reportDeliveryFailed(target)
+                reportDeliveryFailed(target, text: rawText, playSound: playSound)
                 return false
             }
 
@@ -572,21 +579,32 @@ final class PinnedDestinationManager: ObservableObject {
                 reportDeliveredWithoutSubmission(target)
                 return true
             case .writeFailed:
-                reportDeliveryFailed(target)
+                reportDeliveryFailed(target, text: rawText, playSound: playSound)
                 return false
             }
         }
     }
 
-    private func reportGone(_ target: PinnedTarget) {
+    /// The destination is CONFIRMED gone (a dead iTerm2 session id, or a terminated
+    /// app for an AX target) - never called merely because one write attempt failed,
+    /// see `reportDeliveryFailed` for that. The pin itself is NEVER cleared here, only
+    /// the (best-effort, purely cosmetic) tint marking - which named exactly this now-
+    /// gone session - since only an explicit user unpin clears a pin (see
+    /// `unpin(notify:)`). Leaving the pin in place means a later delivery attempt gets
+    /// a fresh liveness check (iTerm2) or re-resolution (AX), so a destination that
+    /// comes back - iTerm2 relaunched, the app reopened - can be reached again without
+    /// the user having to re-pin. If it truly never comes back, delivery simply keeps
+    /// failing for that pin until the user unpins.
+    private func reportGone(_ target: PinnedTarget, text: String, playSound: Bool) {
         clearActiveITermMarkingIfNeeded()
-        pinned = nil
+        copyFailedDeliveryToClipboard(text)
 
         NotificationManager.shared.showNotification(
             title: String(
-                format: String(localized: "Pinned destination (%@) is gone. Text was not delivered."),
+                format: String(localized: "Pinned destination (%@) is gone. The text was copied to the clipboard."),
                 target.displayLabel),
-            type: .error
+            type: .error,
+            playSound: playSound
         )
     }
 
@@ -598,28 +616,63 @@ final class PinnedDestinationManager: ObservableObject {
     /// and free of error codes, since the fix is a System Settings toggle, not
     /// something the user can debug. `destinationLabel` is a plain app name when
     /// permission was denied before VoiceInk could learn anything more specific, or the
-    /// fuller `PinnedTarget.displayLabel` once a target is already known.
-    private func reportPermissionDenied(destinationLabel: String) {
+    /// fuller `PinnedTarget.displayLabel` once a target is already known. `text` is nil
+    /// when this is reported at pin-CAPTURE time (nothing was ever attempted to
+    /// deliver, so there is nothing to copy) and non-nil when reported at delivery
+    /// time, which is when the clipboard fallback applies.
+    private func reportPermissionDenied(destinationLabel: String, text: String? = nil, playSound: Bool = true) {
+        if let text {
+            copyFailedDeliveryToClipboard(text)
+            NotificationManager.shared.showNotification(
+                title: String(
+                    format: String(
+                        localized:
+                            "VoiceInk needs permission to control %@. The text was copied to the clipboard. Grant access in System Settings → Privacy & Security → Automation."
+                    ),
+                    destinationLabel),
+                type: .error,
+                playSound: playSound
+            )
+            return
+        }
+
         NotificationManager.shared.showNotification(
             title: String(
                 format: String(
                     localized: "VoiceInk needs permission to control %@. Grant access in System Settings → Privacy & Security → Automation."
                 ),
                 destinationLabel),
-            type: .error
+            type: .error,
+            playSound: playSound
         )
     }
 
-    private func reportDeliveryFailed(_ target: PinnedTarget) {
-        clearActiveITermMarkingIfNeeded()
-        pinned = nil
+    /// A single write attempt failed - unlike `reportGone`, the destination is NOT
+    /// confirmed gone here (liveness/re-resolution already passed by the time this is
+    /// reached), so neither the pin nor its visual marking is touched: the marking
+    /// still correctly identifies the still-live pinned session, and the pin stays so
+    /// the next dictation can simply try again.
+    private func reportDeliveryFailed(_ target: PinnedTarget, text: String, playSound: Bool) {
+        copyFailedDeliveryToClipboard(text)
 
         NotificationManager.shared.showNotification(
             title: String(
-                format: String(localized: "Could not deliver to pinned destination (%@). Text was not delivered."),
+                format: String(
+                    localized: "Could not deliver to pinned destination (%@). The text was copied to the clipboard."),
                 target.displayLabel),
-            type: .error
+            type: .error,
+            playSound: playSound
         )
+    }
+
+    /// Copies dictated text to the general clipboard as a last resort whenever a
+    /// pinned delivery fails for any reason - the user is by definition looking
+    /// elsewhere while this runs, so a failed delivery would otherwise lose the
+    /// transcript outright. Not a transient/session-scoped copy (unlike
+    /// `ClipboardManager`'s paste flow): this is meant to sit on the clipboard until
+    /// the user notices and uses it.
+    private func copyFailedDeliveryToClipboard(_ text: String) {
+        _ = ClipboardManager.setClipboard(text)
     }
 
     /// The dictated text was written successfully but the follow-up submit step could
@@ -644,6 +697,46 @@ final class PinnedDestinationManager: ObservableObject {
     private func isAppAlive(pid: pid_t) -> Bool {
         guard let app = NSRunningApplication(processIdentifier: pid) else { return false }
         return !app.isTerminated
+    }
+
+    private func isAppRunning(bundleIdentifier: String) -> Bool {
+        !NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier).isEmpty
+    }
+
+    // MARK: - Transient-failure retry
+
+    /// Delay before retrying a failed AppleScript/AX write against a destination
+    /// confirmed to still be running - see `retryingIfStillRunning`. A judgement call,
+    /// not a measured value: long enough to let whatever caused the transient failure
+    /// (e.g. two concurrent AppleScript calls racing before serialization) clear, short
+    /// enough that a genuine chunk-to-chunk dictation delay isn't noticeably extended.
+    private static let transientFailureRetryDelaySeconds: Double = 0.15
+
+    /// Retries `attempt` once, after `transientFailureRetryDelaySeconds`, if
+    /// `isFailure(result)` and the destination process is verifiably still running
+    /// (`stillRunning`, via `NSRunningApplication` - never assumed). This is exactly
+    /// the situation observed in production: a genuinely live iTerm2 session receiving
+    /// a spurious `-600` ("Application isn't running") from a single AppleScript
+    /// execution, moments after a previous, unserialized AppleScript call to the same
+    /// app had started on another thread. When the process is confirmed gone,
+    /// retrying would only delay reporting a real failure, so this does nothing then.
+    /// Only ever applied to steps that write or probe atomically (a single AppleScript
+    /// `write`/enumeration, or a single AX value read+set) - never to the multi-chunk
+    /// keystroke-injection fallback, where a retry could duplicate whatever chunks the
+    /// "failed" attempt actually did post; see `deliverViaKeystrokes`.
+    // `nonisolated static`, not `private` (despite living alongside instance methods),
+    // so this generic retry policy - which touches no instance state - is
+    // unit-testable with a fake `attempt`/`stillRunning`, same as the other decision
+    // tables in this file.
+    nonisolated static func retryingIfStillRunning<T>(
+        result: T,
+        isFailure: (T) -> Bool,
+        stillRunning: @autoclosure () -> Bool,
+        attempt: () async -> T
+    ) async -> T {
+        guard isFailure(result), stillRunning() else { return result }
+        try? await Task.sleep(nanoseconds: UInt64(Self.transientFailureRetryDelaySeconds * 1_000_000_000))
+        return await attempt()
     }
 
     /// Re-resolves a live, writable, text-ish focused element inside the still-running
@@ -692,13 +785,22 @@ final class PinnedDestinationManager: ObservableObject {
                 return "dead"
             end tell
             """
-        return await runAppleScript(script)
+        let outcome = await runAppleScript(script)
+        // A `.failed` outcome here (the whole AppleScript execution could not even run,
+        // e.g. a transient procNotFound) must not be misread as "session dead" while
+        // iTerm2 is verifiably still running - see `retryingIfStillRunning`.
+        return await Self.retryingIfStillRunning(
+            result: outcome,
+            isFailure: { if case .failed = $0 { return true }; return false },
+            stillRunning: isAppRunning(bundleIdentifier: PinnedTarget.iTermBundleIdentifier),
+            attempt: { await self.runAppleScript(script) }
+        )
     }
 
     // Verified: while the target is alive, AX reads/writes return .success; once its
     // window is closed, they return .invalidUIElement unambiguously. .cannotComplete
     // is NOT a reliable dead signal on its own (it also appears in non-fatal
-    // situations), so only .invalidUIElement clears the pin here.
+    // situations), so only .invalidUIElement is treated as the cached element being dead here.
     private func isAXElementAlive(_ element: AXUIElement) -> Bool {
         var value: CFTypeRef?
         let status = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &value)
@@ -921,6 +1023,15 @@ final class PinnedDestinationManager: ObservableObject {
     /// used by this app's non-pinned AutoEnter feature - await the previous action
     /// actually completing, sleep, THEN perform the next action as a wholly separate
     /// operation - rather than inventing new timing for a closely related problem.
+    ///
+    /// HALF-SENT SEQUENCES. A prefix step that succeeds but is followed by a failed
+    /// text step (the pin now stays intact - see `reportDeliveryFailed`) cannot leave
+    /// the session corrupted for the NEXT delivery: `insertModePrefixStatement` is
+    /// self-cancelling from EITHER starting mode (see its own doc comment), so it ends
+    /// the session in insert mode with an unchanged buffer no matter what mode it found
+    /// - including a mode a previous half-sent sequence left it in. The next delivery's
+    /// own prefix step is therefore correct starting from wherever the last one left
+    /// off, not just from a known-good state.
     private func deliverToITermSession(
         id: String,
         text: String,
@@ -933,8 +1044,19 @@ final class PinnedDestinationManager: ObservableObject {
         var stepResults: [(role: ITermDeliveryStep.Role, result: ITermWriteResult)] = []
 
         for step in steps {
-            let outcome = await writeToITermSession(id: id, statement: step.statement)
-            let result = Self.classifyITermWriteOutcome(outcome)
+            // Each step is a single atomic AppleScript `write`, so retrying it after a
+            // `.failed` execution (the whole script did not run - never "ran and typed
+            // something, then errored") cannot type the step's text twice - see
+            // `retryingIfStillRunning`.
+            let firstResult = Self.classifyITermWriteOutcome(await writeToITermSession(id: id, statement: step.statement))
+            let result = await Self.retryingIfStillRunning(
+                result: firstResult,
+                isFailure: { $0 == .failed },
+                stillRunning: isAppRunning(bundleIdentifier: PinnedTarget.iTermBundleIdentifier),
+                attempt: {
+                    Self.classifyITermWriteOutcome(await self.writeToITermSession(id: id, statement: step.statement))
+                }
+            )
             stepResults.append((step.role, result))
             // Role and result only - the statement embeds the dictated text.
             logger.notice(
@@ -968,8 +1090,16 @@ final class PinnedDestinationManager: ObservableObject {
     /// than being absorbed as pasted content. See point 3 of the section comment above.
     /// Always addressed to the pinned session id, so it can never land in another pane.
     private func submitToITermSession(id: String) async -> ITermWriteResult {
-        let result = Self.classifyITermWriteOutcome(
-            await writeToITermSession(id: id, statement: "write text return newline no"))
+        let statement = "write text return newline no"
+        let firstResult = Self.classifyITermWriteOutcome(await writeToITermSession(id: id, statement: statement))
+        // Same atomicity reasoning as the delivery step loop above: a single write,
+        // safe to retry once after a confirmed-transient failure.
+        let result = await Self.retryingIfStillRunning(
+            result: firstResult,
+            isFailure: { $0 == .failed },
+            stillRunning: isAppRunning(bundleIdentifier: PinnedTarget.iTermBundleIdentifier),
+            attempt: { Self.classifyITermWriteOutcome(await self.writeToITermSession(id: id, statement: statement)) }
+        )
         logger.notice("iTerm submit via separate CR write result=\(String(describing: result), privacy: .public)")
         return result
     }
@@ -980,8 +1110,9 @@ final class PinnedDestinationManager: ObservableObject {
     // something is pinned, but not WHICH pane - they still have to hunt for it. This tints the
     // pinned session's background so it is identifiable at a glance, entirely opt-in (see
     // `PinnedDestinationSettingsKeys.highlightPinnedITermSession`) and always reverted: on
-    // explicit unpin, on re-pinning to a different target, and (best-effort) when the pin
-    // self-clears because the session died.
+    // explicit unpin, on re-pinning to a different target, and (best-effort) when the
+    // session is confirmed to have died - the marking clears even though the PIN itself
+    // does not; see `reportGone`.
     //
     // MECHANISM: a session's `background color` is directly readable and writable over
     // AppleScript as an RGB triple of 16-bit components. Verified against a live session -
@@ -1276,10 +1407,11 @@ final class PinnedDestinationManager: ObservableObject {
     }
 
     /// Synchronously claims whatever marking is currently active (if any) and hands the actual
-    /// restore off to a detached, unawaited task. Called from every path that stops a session
-    /// being the pinned one: explicit unpin, re-pinning to a different target, and a pin
-    /// self-clearing because the session died (`reportGone`) or delivery otherwise permanently
-    /// failed (`reportDeliveryFailed`). Claiming the state synchronously - nil-ing it out before
+    /// restore off to a detached, unawaited task. Called from every path that stops a SESSION
+    /// being marked: explicit unpin, re-pinning to a different target, and the session being
+    /// confirmed dead (`reportGone`) - never from `reportDeliveryFailed`, which does not touch
+    /// the marking, since the session there is not confirmed gone, only one write attempt
+    /// failed. Claiming the state synchronously - nil-ing it out before
     /// the restore even starts - is what guarantees a restore is attempted AT MOST once no
     /// matter how many of those paths run or how they interleave, and is also why this never
     /// awaits its own restore: unpinning must complete immediately regardless of how long the
@@ -1349,9 +1481,34 @@ final class PinnedDestinationManager: ObservableObject {
         case writeFailed
     }
 
-    private func deliverToAXElement(element: AXUIElement, pid: pid_t, text: String, appendReturn: Bool)
+    private func deliverToAXElement(element: AXUIElement, pid: pid_t, text: String, appendReturn: Bool) async
         -> AXDeliveryWriteOutcome
     {
+        // A single read-then-set attempt: `AXUIElementSetAttributeValue` either applies
+        // the whole new value or none of it, so retrying after a `.writeFailed` here
+        // (re-reading the current value fresh each time) cannot append the transcript
+        // twice - unlike the keystroke fallback below, which cannot make the same
+        // guarantee.
+        var writeOutcome = writeAXElementValue(element: element, text: text)
+        if writeOutcome == .writeFailed, isAppAlive(pid: pid) {
+            try? await Task.sleep(nanoseconds: UInt64(Self.transientFailureRetryDelaySeconds * 1_000_000_000))
+            writeOutcome = writeAXElementValue(element: element, text: text)
+        }
+        guard writeOutcome != .writeFailed else { return .writeFailed }
+
+        guard appendReturn else { return .delivered }
+
+        switch submitAXElement(element, pid: pid) {
+        case .submittedViaConfirmAction, .submittedViaKeyEvent:
+            return .delivered
+        case .notSubmitted:
+            return .deliveredWithoutSubmission
+        }
+    }
+
+    /// One read-then-set attempt at writing `text` onto `element`'s value, with no
+    /// retry of its own - see `deliverToAXElement`, the only caller, for the retry.
+    private func writeAXElementValue(element: AXUIElement, text: String) -> AXDeliveryWriteOutcome {
         var currentValueRef: CFTypeRef?
         let readStatus = AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &currentValueRef)
         guard readStatus == .success || readStatus == .noValue || readStatus == .attributeUnsupported else {
@@ -1366,16 +1523,7 @@ final class PinnedDestinationManager: ObservableObject {
         let newValue = currentValue + text
 
         let setStatus = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, newValue as CFTypeRef)
-        guard setStatus == .success else { return .writeFailed }
-
-        guard appendReturn else { return .delivered }
-
-        switch submitAXElement(element, pid: pid) {
-        case .submittedViaConfirmAction, .submittedViaKeyEvent:
-            return .delivered
-        case .notSubmitted:
-            return .deliveredWithoutSubmission
-        }
+        return setStatus == .success ? .delivered : .writeFailed
     }
 
     /// Outcome of trying to submit (send Return) after a value write has already
@@ -1539,6 +1687,14 @@ final class PinnedDestinationManager: ObservableObject {
     /// Delivers `text` to a keystroke-only pinned target (see `PinnedTarget.axKeystrokeElement`)
     /// by posting synthetic key events straight to `pid`, reusing `postReturnKeyEvent` for the
     /// optional submit step so both AX delivery mechanisms submit identically.
+    ///
+    /// Deliberately has NO transient-failure retry, unlike `deliverToAXElement` and the iTerm2
+    /// writes: `postUnicodeString` posts one CGEvent per chunk of the transcript (see
+    /// `maxUnicodeCharactersPerKeyEvent`) and cannot report which chunk failed or roll back the
+    /// ones that already posted, so a blind retry on a partial failure risks re-posting - and
+    /// thus duplicating - whatever text already made it through. A `false` here almost always
+    /// means missing Accessibility permission or a CGEvent construction failure, neither of
+    /// which a 150ms retry would fix anyway.
     private func deliverViaKeystrokes(pid: pid_t, text: String, appendReturn: Bool) -> AXDeliveryWriteOutcome {
         let textPosted = postUnicodeString(text, toPid: pid)
         let submitPosted = (textPosted && appendReturn) ? postReturnKeyEvent(toPid: pid) : false
@@ -1624,21 +1780,26 @@ final class PinnedDestinationManager: ObservableObject {
             .joined(separator: " & linefeed & ")
     }
 
-    /// Executes `source` and classifies the outcome. Runs off the main actor via an
-    /// explicit `Task.detached`: iTerm2's AppleScript cost scales with how many
+    /// Executes `source` and classifies the outcome. Runs off the main actor, through
+    /// the app-wide `AppleScriptSerialExecutor`, never a plain `Task.detached`:
+    /// `NSAppleScript` is not thread-safe, and this file issues many overlapping calls
+    /// (delivery steps, tint/highlight scripts, session lookups) that, run concurrently
+    /// on different detached threads, were the actual cause of a spurious `-600`
+    /// ("Application isn't running") against a genuinely live iTerm2 session - see the
+    /// doc comment on `AppleScriptSerialExecutor`. Serializing through one shared queue
+    /// fixes that at the root, for every AppleScript call in the app, not just this
+    /// one. Still off the main thread - iTerm2's AppleScript cost scales with how many
     /// windows/tabs/sessions are open (the enumeration used above visits all of them),
-    /// so running this synchronously on the main thread could stall the whole app -
-    /// including dropping an in-flight transcript - for however long that enumeration
+    /// so running this synchronously on the main thread could stall the whole app,
+    /// including dropping an in-flight transcript, for however long that enumeration
     /// takes with many panes open. `nonisolated` so the function itself carries no
-    /// actor affinity; the `Task.detached` is what actually guarantees the blocking
-    /// AppleScript call happens off the main thread rather than merely being awaitable
-    /// from it. No timeout is imposed: a slow-but-eventually-successful lookup must
-    /// never be misreported as a dead destination, and moving the call off the main
-    /// thread already removes the actual hazard (a frozen UI), so there is nothing left
-    /// that a timeout would need to protect against here.
+    /// actor affinity. No timeout is imposed: a slow-but-eventually-successful lookup
+    /// must never be misreported as a dead destination, and moving the call off the
+    /// main thread already removes the actual hazard (a frozen UI), so there is
+    /// nothing left that a timeout would need to protect against here.
     private nonisolated func runAppleScript(_ source: String) async -> AppleScriptOutcome {
         let logger = self.logger
-        return await Task.detached(priority: .userInitiated) {
+        return await AppleScriptSerialExecutor.run {
             guard let script = NSAppleScript(source: source) else { return .failed }
 
             var errorDict: NSDictionary?
@@ -1656,6 +1817,6 @@ final class PinnedDestinationManager: ObservableObject {
             case .targetNotRunning, .other:
                 return .failed
             }
-        }.value
+        }
     }
 }

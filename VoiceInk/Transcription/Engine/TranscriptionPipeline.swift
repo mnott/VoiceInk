@@ -44,6 +44,14 @@ class TranscriptionPipeline {
     ///   - audioURL: The recorded audio file.
     ///   - transcriptionConfiguration: Mode-resolved transcription engine settings for this phase.
     ///   - session: An active streaming session if one was prepared, otherwise nil.
+    ///   - pretranscribedText: When set, skips transcribing `audioURL` and runs the rest of the
+    ///     pipeline (filter, format, word replacement, enhancement, delivery, History save) on
+    ///     this text instead - used by meeting capture, which transcribes its mic and system
+    ///     tracks separately and hands in their already-combined text.
+    ///   - saveToHistory: When false, `transcription` is filtered/formatted/enhanced/delivered
+    ///     exactly as usual but never saved or posted as a History event - used by meeting-chunk
+    ///     deliveries, which are paste-only; the meeting's one History record is created
+    ///     separately once, at Toggle Meeting Capture stop.
     ///   - onStateChange: Called when the pipeline moves to a new recording state (e.g. `.enhancing`).
     ///   - shouldCancel: Returns true if the user requested cancellation.
     ///   - onCancel: Called when cancellation is detected to cancel active session state.
@@ -54,6 +62,7 @@ class TranscriptionPipeline {
         transcriptionConfiguration: TranscriptionRuntimeConfiguration,
         formattingConfiguration resolveFormattingConfiguration: @escaping () -> TranscriptionFormattingConfiguration,
         session: TranscriptionSession?,
+        pretranscribedText: String? = nil,
         triggerWordModeSelection: @escaping (String) -> String? = { _ in nil },
         enhancementConfiguration: @escaping () -> EnhancementRuntimeConfiguration?,
         recordingContextSnapshot: @escaping () async -> RecordingContextSnapshot? = { nil },
@@ -62,7 +71,9 @@ class TranscriptionPipeline {
         shouldCancel: () -> Bool,
         onCancel: @escaping () async -> Void,
         onDismiss: @escaping () async -> Void,
-        assistant: AssistantHooks = .inactive
+        assistant: AssistantHooks = .inactive,
+        playsFeedbackSound: Bool = true,
+        saveToHistory: Bool = true
     ) async {
         let model = transcriptionConfiguration.model
         var finalText: String?
@@ -87,6 +98,7 @@ class TranscriptionPipeline {
                 modelName: transcription.transcriptionModelName ?? model.displayName
             )
 
+            guard saveToHistory else { return }
             do {
                 try modelContext.save()
             } catch {
@@ -102,7 +114,9 @@ class TranscriptionPipeline {
         do {
             let transcriptionStart = Date()
             var text: String
-            if let session {
+            if let pretranscribedText {
+                text = pretranscribedText
+            } else if let session {
                 text = try await session.transcribe(audioURL: audioURL)
             } else {
                 text = try await serviceRegistry.transcribe(
@@ -232,7 +246,8 @@ class TranscriptionPipeline {
                     NotificationManager.shared.showNotification(
                         title: errorDescription,
                         type: .error,
-                        duration: 5.0
+                        duration: 5.0,
+                        playSound: playsFeedbackSound
                     )
                 }
             }
@@ -242,6 +257,8 @@ class TranscriptionPipeline {
         }
 
         func saveTranscriptionAndPostCompletion() {
+            guard saveToHistory else { return }
+
             if transcription.transcriptionStatus == TranscriptionStatus.completed.rawValue {
                 do {
                     didInsertSessionMetric = try SessionMetricRecorder.recordRecorderSession(
@@ -277,7 +294,8 @@ class TranscriptionPipeline {
                 output: outputForDelivery ?? outputConfiguration(),
                 responseConfig: responseConfig,
                 responseError: responseError,
-                isAssistantFollowUp: assistant.isFollowUp
+                isAssistantFollowUp: assistant.isFollowUp,
+                playsFeedbackSound: playsFeedbackSound
             ),
             actions: TranscriptionDelivery.Actions(
                 setState: onStateChange,
