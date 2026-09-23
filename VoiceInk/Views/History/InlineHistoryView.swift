@@ -6,6 +6,7 @@ struct InlineHistoryView: View {
     @State private var searchText = ""
     @State private var expandedId: UUID?
     @State private var selectedTranscriptions: Set<Transcription> = []
+    @State private var selectionAnchor: Transcription?
     @State private var showDeleteConfirmation = false
     @State private var isPanelPresented = false
     @State private var panelMode: InlineHistoryPanelMode = .info
@@ -15,6 +16,9 @@ struct InlineHistoryView: View {
     @State private var hasMoreContent = true
     @State private var lastTimestamp: Date?
     @State private var isViewCurrentlyVisible = false
+
+    private enum HistoryFocusTarget: Hashable { case search, list }
+    @FocusState private var focusedField: HistoryFocusTarget?
 
     private let exportService = VoiceInkCSVExportService()
     private let pageSize = 20
@@ -88,6 +92,20 @@ struct InlineHistoryView: View {
                 emptyStateView
             } else {
                 cardListView
+                    .focusable()
+                    .focused($focusedField, equals: .list)
+                    .onKeyPress { keyPress in
+                        if keyPress.key == "a" && keyPress.modifiers.contains(.command) {
+                            selectAllVisibleTranscriptions()
+                            return .handled
+                        }
+                        if keyPress.key == .delete || keyPress.key == .deleteForward {
+                            guard !selectedTranscriptions.isEmpty else { return .ignored }
+                            showDeleteConfirmation = true
+                            return .handled
+                        }
+                        return .ignored
+                    }
             }
 
             if !selectedTranscriptions.isEmpty {
@@ -122,6 +140,7 @@ struct InlineHistoryView: View {
         }
         .onAppear {
             isViewCurrentlyVisible = true
+            focusedField = .list
             Task { await loadInitialContent() }
         }
         .onDisappear {
@@ -155,6 +174,7 @@ struct InlineHistoryView: View {
                 TextField("Search transcriptions...", text: $searchText)
                     .textFieldStyle(.plain)
                     .font(.system(size: 13))
+                    .focused($focusedField, equals: .search)
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
@@ -273,6 +293,7 @@ struct InlineHistoryView: View {
                             }
                         },
                         onToggleCheck: { toggleSelection(transcription) },
+                        onSelectionClick: { modifier in handleSelectionClick(transcription, modifier: modifier) },
                         onShowInfo: {
                             openPanel(mode: .info, transcriptionID: transcription.id)
                         }
@@ -388,6 +409,25 @@ struct InlineHistoryView: View {
         } else {
             selectedTranscriptions.insert(transcription)
         }
+        selectionAnchor = transcription
+    }
+
+    private func handleSelectionClick(_ transcription: Transcription, modifier: HistoryRowClickModifier) {
+        let result = HistorySelectionHelper.selection(
+            clicking: transcription,
+            in: displayedTranscriptions,
+            current: selectedTranscriptions,
+            anchor: selectionAnchor,
+            modifier: modifier
+        )
+        selectedTranscriptions = result.selection
+        selectionAnchor = result.anchor
+    }
+
+    private func selectAllVisibleTranscriptions() {
+        guard !displayedTranscriptions.isEmpty else { return }
+        selectedTranscriptions = HistorySelectionHelper.selectAll(visibleItems: displayedTranscriptions)
+        selectionAnchor = displayedTranscriptions.last
     }
 
     private func performDeletion(for transcription: Transcription) {
@@ -408,6 +448,9 @@ struct InlineHistoryView: View {
         if panelTranscriptionId == transcription.id {
             panelTranscriptionId = nil
             closePanel()
+        }
+        if selectionAnchor == transcription {
+            selectionAnchor = nil
         }
 
         selectedTranscriptions.remove(transcription)
@@ -476,6 +519,7 @@ private struct HistoryCardRow: View {
     let isChecked: Bool
     let onToggleExpand: () -> Void
     let onToggleCheck: () -> Void
+    let onSelectionClick: (HistoryRowClickModifier) -> Void
     let onShowInfo: () -> Void
 
     @State private var selectedTab: TranscriptionTab = .original
@@ -506,7 +550,13 @@ private struct HistoryCardRow: View {
                     "",
                     isOn: Binding(
                         get: { isChecked },
-                        set: { _ in onToggleCheck() }
+                        set: { _ in
+                            if let modifier = HistoryRowClickModifier.current {
+                                onSelectionClick(modifier)
+                            } else {
+                                onToggleCheck()
+                            }
+                        }
                     )
                 )
                 .toggleStyle(CircularCheckboxStyle())
@@ -534,7 +584,13 @@ private struct HistoryCardRow: View {
                     .animation(.easeInOut(duration: 0.2), value: isExpanded)
             }
             .contentShape(Rectangle())
-            .onTapGesture { onToggleExpand() }
+            .onTapGesture {
+                if let modifier = HistoryRowClickModifier.current {
+                    onSelectionClick(modifier)
+                } else {
+                    onToggleExpand()
+                }
+            }
 
             if isExpanded {
                 expandedContent

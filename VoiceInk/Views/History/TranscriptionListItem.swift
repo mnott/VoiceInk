@@ -6,6 +6,7 @@ struct TranscriptionListItem: View {
     let isChecked: Bool
     let onSelect: () -> Void
     let onToggleCheck: () -> Void
+    let onSelectionClick: (HistoryRowClickModifier) -> Void
 
     var body: some View {
         HStack(spacing: 8) {
@@ -13,7 +14,13 @@ struct TranscriptionListItem: View {
                 "",
                 isOn: Binding(
                     get: { isChecked },
-                    set: { _ in onToggleCheck() }
+                    set: { _ in
+                        if let modifier = HistoryRowClickModifier.current {
+                            onSelectionClick(modifier)
+                        } else {
+                            onToggleCheck()
+                        }
+                    }
                 )
             )
             .toggleStyle(CircularCheckboxStyle())
@@ -63,7 +70,13 @@ struct TranscriptionListItem: View {
             }
         }
         .contentShape(Rectangle())
-        .onTapGesture { onSelect() }
+        .onTapGesture {
+            if let modifier = HistoryRowClickModifier.current {
+                onSelectionClick(modifier)
+            } else {
+                onSelect()
+            }
+        }
     }
 }
 

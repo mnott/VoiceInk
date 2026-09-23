@@ -6,6 +6,7 @@ struct TranscriptionHistoryView: View {
     @State private var searchText = ""
     @State private var selectedTranscription: Transcription?
     @State private var selectedTranscriptions: Set<Transcription> = []
+    @State private var selectionAnchor: Transcription?
     @State private var showDeleteConfirmation = false
     @State private var isViewCurrentlyVisible = false
     @State private var isAnalysisPanelPresented = false
@@ -16,6 +17,9 @@ struct TranscriptionHistoryView: View {
     @State private var isLoading = false
     @State private var hasMoreContent = true
     @State private var lastTimestamp: Date?
+
+    private enum HistoryFocusTarget: Hashable { case search, list }
+    @FocusState private var focusedField: HistoryFocusTarget?
 
     private let exportService = VoiceInkCSVExportService()
     private let pageSize = 20
@@ -143,6 +147,7 @@ struct TranscriptionHistoryView: View {
         }
         .onAppear {
             isViewCurrentlyVisible = true
+            focusedField = .list
             Task {
                 await loadInitialContent()
             }
@@ -194,6 +199,7 @@ struct TranscriptionHistoryView: View {
                 TextField("Search transcriptions", text: $searchText)
                     .textFieldStyle(PlainTextFieldStyle())
                     .font(.system(size: 13))
+                    .focused($focusedField, equals: .search)
             }
             .padding(10)
             .background(
@@ -227,8 +233,12 @@ struct TranscriptionHistoryView: View {
                                     transcription: transcription,
                                     isSelected: selectedTranscription == transcription,
                                     isChecked: selectedTranscriptions.contains(transcription),
-                                    onSelect: { selectedTranscription = transcription },
-                                    onToggleCheck: { toggleSelection(transcription) }
+                                    onSelect: {
+                                        selectedTranscription = transcription
+                                        selectionAnchor = transcription
+                                    },
+                                    onToggleCheck: { toggleSelection(transcription) },
+                                    onSelectionClick: { modifier in handleSelectionClick(transcription, modifier: modifier) }
                                 )
                             }
 
@@ -259,6 +269,20 @@ struct TranscriptionHistoryView: View {
                     selectionToolbar
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
+            }
+            .focusable()
+            .focused($focusedField, equals: .list)
+            .onKeyPress { keyPress in
+                if keyPress.key == "a" && keyPress.modifiers.contains(.command) {
+                    selectAllVisibleTranscriptions()
+                    return .handled
+                }
+                if keyPress.key == .delete || keyPress.key == .deleteForward {
+                    guard !selectedTranscriptions.isEmpty else { return .ignored }
+                    showDeleteConfirmation = true
+                    return .handled
+                }
+                return .ignored
             }
         }
         .background(sidebarMaterialBackground)
@@ -453,6 +477,9 @@ struct TranscriptionHistoryView: View {
         if selectedTranscription == transcription {
             selectedTranscription = nil
         }
+        if selectionAnchor == transcription {
+            selectionAnchor = nil
+        }
 
         selectedTranscriptions.remove(transcription)
         modelContext.delete(transcription)
@@ -486,6 +513,25 @@ struct TranscriptionHistoryView: View {
         } else {
             selectedTranscriptions.insert(transcription)
         }
+        selectionAnchor = transcription
+    }
+
+    private func handleSelectionClick(_ transcription: Transcription, modifier: HistoryRowClickModifier) {
+        let result = HistorySelectionHelper.selection(
+            clicking: transcription,
+            in: displayedTranscriptions,
+            current: selectedTranscriptions,
+            anchor: selectionAnchor,
+            modifier: modifier
+        )
+        selectedTranscriptions = result.selection
+        selectionAnchor = result.anchor
+    }
+
+    private func selectAllVisibleTranscriptions() {
+        guard !displayedTranscriptions.isEmpty else { return }
+        selectedTranscriptions = HistorySelectionHelper.selectAll(visibleItems: displayedTranscriptions)
+        selectionAnchor = displayedTranscriptions.last
     }
 
     private func selectAllTranscriptions() async {
