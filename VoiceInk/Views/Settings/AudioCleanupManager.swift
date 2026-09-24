@@ -59,9 +59,12 @@ class AudioCleanupManager {
             // Execute SwiftData operations on the main thread
             return try await MainActor.run {
                 // Create a predicate to find transcriptions with audio files older than the cutoff date
+                // Recently Deleted records are excluded - their audio is kept for
+                // `TranscriptionTrashService.retentionDays` regardless of this disk-space setting.
                 let descriptor = FetchDescriptor<Transcription>(
                     predicate: #Predicate<Transcription> { transcription in
                         transcription.timestamp < cutoffDate && transcription.audioFileURL != nil
+                            && transcription.deletedAt == nil
                     }
                 )
 
@@ -113,9 +116,12 @@ class AudioCleanupManager {
             // Execute SwiftData operations on the main thread
             try await MainActor.run {
                 // Create a predicate to find transcriptions with audio files older than the cutoff date
+                // Recently Deleted records are excluded - their audio is kept for
+                // `TranscriptionTrashService.retentionDays` regardless of this disk-space setting.
                 let descriptor = FetchDescriptor<Transcription>(
                     predicate: #Predicate<Transcription> { transcription in
                         transcription.timestamp < cutoffDate && transcription.audioFileURL != nil
+                            && transcription.deletedAt == nil
                     }
                 )
 

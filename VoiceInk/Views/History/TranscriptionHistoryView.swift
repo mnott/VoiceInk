@@ -1,3 +1,4 @@
+import AppKit
 import SwiftData
 import SwiftUI
 
@@ -8,6 +9,9 @@ struct TranscriptionHistoryView: View {
     @State private var selectedTranscriptions: Set<Transcription> = []
     @State private var selectionAnchor: Transcription?
     @State private var showDeleteConfirmation = false
+    @State private var isShowingDeleted = false
+    @State private var showPermanentDeleteConfirmation = false
+    @State private var showEmptyConfirmation = false
     @State private var isViewCurrentlyVisible = false
     @State private var isAnalysisPanelPresented = false
     @State private var isLeftSidebarVisible = true
@@ -17,6 +21,8 @@ struct TranscriptionHistoryView: View {
     @State private var isLoading = false
     @State private var hasMoreContent = true
     @State private var lastTimestamp: Date?
+    @State private var hostingWindow: NSWindow?
+    @State private var deleteKeyMonitor: Any?
 
     private enum HistoryFocusTarget: Hashable { case search, list }
     @FocusState private var focusedField: HistoryFocusTarget?
@@ -39,23 +45,30 @@ struct TranscriptionHistoryView: View {
         var descriptor = FetchDescriptor<Transcription>(
             sortBy: [SortDescriptor(\Transcription.timestamp, order: .reverse)]
         )
+        let showingDeleted = isShowingDeleted
 
         if let timestamp = timestamp {
             if !searchText.isEmpty {
                 descriptor.predicate = #Predicate<Transcription> { transcription in
-                    (transcription.text.localizedStandardContains(searchText)
-                        || (transcription.enhancedText?.localizedStandardContains(searchText) ?? false))
+                    (transcription.deletedAt != nil) == showingDeleted
+                        && (transcription.text.localizedStandardContains(searchText)
+                            || (transcription.enhancedText?.localizedStandardContains(searchText) ?? false))
                         && transcription.timestamp < timestamp
                 }
             } else {
                 descriptor.predicate = #Predicate<Transcription> { transcription in
-                    transcription.timestamp < timestamp
+                    (transcription.deletedAt != nil) == showingDeleted && transcription.timestamp < timestamp
                 }
             }
         } else if !searchText.isEmpty {
             descriptor.predicate = #Predicate<Transcription> { transcription in
-                transcription.text.localizedStandardContains(searchText)
-                    || (transcription.enhancedText?.localizedStandardContains(searchText) ?? false)
+                (transcription.deletedAt != nil) == showingDeleted
+                    && (transcription.text.localizedStandardContains(searchText)
+                        || (transcription.enhancedText?.localizedStandardContains(searchText) ?? false))
+            }
+        } else {
+            descriptor.predicate = #Predicate<Transcription> { transcription in
+                (transcription.deletedAt != nil) == showingDeleted
             }
         }
 
@@ -118,8 +131,23 @@ struct TranscriptionHistoryView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            let count = selectedTranscriptions.count
-            Text(String(localized: "This action cannot be undone. Are you sure you want to delete \(count) items?"))
+            Text(HistoryDeleteMessage.softDelete(count: selectedTranscriptions.count))
+        }
+        .alert("Delete Permanently?", isPresented: $showPermanentDeleteConfirmation) {
+            Button("Delete Permanently", role: .destructive) {
+                permanentlyDeleteSelectedTranscriptions()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(HistoryDeleteMessage.permanentDelete(count: selectedTranscriptions.count))
+        }
+        .alert("Empty Recently Deleted?", isPresented: $showEmptyConfirmation) {
+            Button("Empty", role: .destructive) {
+                emptyRecentlyDeleted()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This action cannot be undone. All items in Recently Deleted will be permanently deleted.")
         }
         .sidePanel(
             isPresented: .init(
@@ -145,17 +173,28 @@ struct TranscriptionHistoryView: View {
             )
             .id(selectedTranscriptions.count)
         }
+        .background(WindowAccessor { window in hostingWindow = window })
         .onAppear {
             isViewCurrentlyVisible = true
             focusedField = .list
+            installDeleteKeyMonitor()
             Task {
                 await loadInitialContent()
             }
         }
         .onDisappear {
             isViewCurrentlyVisible = false
+            removeDeleteKeyMonitor()
         }
         .onChange(of: searchText) { _, _ in
+            Task {
+                await resetPagination()
+                await loadInitialContent()
+            }
+        }
+        .onChange(of: isShowingDeleted) { _, _ in
+            selectedTranscriptions.removeAll()
+            selectedTranscription = nil
             Task {
                 await resetPagination()
                 await loadInitialContent()
@@ -200,6 +239,13 @@ struct TranscriptionHistoryView: View {
                     .textFieldStyle(PlainTextFieldStyle())
                     .font(.system(size: 13))
                     .focused($focusedField, equals: .search)
+
+                Button(action: { withAnimation { isShowingDeleted.toggle() } }) {
+                    Image(systemName: isShowingDeleted ? "trash.fill" : "trash")
+                        .foregroundColor(isShowingDeleted ? AppTheme.Accent.primary : .secondary)
+                }
+                .buttonStyle(.plain)
+                .help(isShowingDeleted ? "Back to History" : "Recently Deleted")
             }
             .padding(10)
             .background(
@@ -220,7 +266,7 @@ struct TranscriptionHistoryView: View {
                         Image(systemName: "doc.text.magnifyingglass")
                             .font(.system(size: 40))
                             .foregroundColor(.secondary)
-                        Text("No transcriptions")
+                        Text(isShowingDeleted ? "Recently Deleted is empty" : "No transcriptions")
                             .font(.system(size: 14, weight: .medium))
                             .foregroundColor(.secondary)
                     }
@@ -275,11 +321,6 @@ struct TranscriptionHistoryView: View {
             .onKeyPress { keyPress in
                 if keyPress.key == "a" && keyPress.modifiers.contains(.command) {
                     selectAllVisibleTranscriptions()
-                    return .handled
-                }
-                if keyPress.key == .delete || keyPress.key == .deleteForward {
-                    guard !selectedTranscriptions.isEmpty else { return .ignored }
-                    showDeleteConfirmation = true
                     return .handled
                 }
                 return .ignored
@@ -373,33 +414,59 @@ struct TranscriptionHistoryView: View {
                 Divider()
                     .frame(height: 16)
 
-                Button(action: {
-                    openAnalysisPanel()
-                }) {
-                    Image(systemName: "chart.bar.xaxis")
-                        .font(.system(size: 14, weight: .regular))
-                        .foregroundColor(.secondary)
-                }
-                .buttonStyle(.plain)
-                .help("Analyze")
+                if isShowingDeleted {
+                    Button(action: { restoreSelectedTranscriptions() }) {
+                        Image(systemName: "arrow.uturn.backward")
+                            .font(.system(size: 14, weight: .regular))
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Restore")
 
-                Button(action: {
-                    exportService.exportTranscriptionsToCSV(transcriptions: Array(selectedTranscriptions))
-                }) {
-                    Image(systemName: "square.and.arrow.up")
-                        .font(.system(size: 14, weight: .regular))
-                        .foregroundColor(.secondary)
-                }
-                .buttonStyle(.plain)
-                .help("Export")
+                    Button(action: { showPermanentDeleteConfirmation = true }) {
+                        Image(systemName: "trash")
+                            .font(.system(size: 14, weight: .regular))
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Delete Permanently")
+                } else {
+                    Button(action: {
+                        openAnalysisPanel()
+                    }) {
+                        Image(systemName: "chart.bar.xaxis")
+                            .font(.system(size: 14, weight: .regular))
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Analyze")
 
-                Button(action: { showDeleteConfirmation = true }) {
-                    Image(systemName: "trash")
-                        .font(.system(size: 14, weight: .regular))
-                        .foregroundColor(.secondary)
+                    Button(action: {
+                        exportService.exportTranscriptionsToCSV(transcriptions: Array(selectedTranscriptions))
+                    }) {
+                        Image(systemName: "square.and.arrow.up")
+                            .font(.system(size: 14, weight: .regular))
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Export")
+
+                    Button(action: { showDeleteConfirmation = true }) {
+                        Image(systemName: "trash")
+                            .font(.system(size: 14, weight: .regular))
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Delete")
                 }
-                .buttonStyle(.plain)
-                .help("Delete")
+            } else if isShowingDeleted {
+                Divider()
+                    .frame(height: 16)
+
+                Button("Empty", role: .destructive) { showEmptyConfirmation = true }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 13))
+                    .foregroundColor(AppTheme.Status.error)
             }
 
             Spacer()
@@ -462,27 +529,58 @@ struct TranscriptionHistoryView: View {
         isLoading = false
     }
 
-    private func performDeletion(for transcription: Transcription) {
-        if let urlString = transcription.audioFileURL,
-            let url = URL(string: urlString),
-            FileManager.default.fileExists(atPath: url.path)
-        {
-            do {
-                try FileManager.default.removeItem(at: url)
-            } catch {
-                print("Error deleting audio file: \(error.localizedDescription)")
-            }
-        }
+    private func installDeleteKeyMonitor() {
+        guard deleteKeyMonitor == nil else { return }
+        deleteKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard event.window != nil, event.window === hostingWindow else { return event }
+            let isEditingText = hostingWindow?.firstResponder is NSText
+            guard
+                HistoryDeleteKeyHandler.shouldRequestDelete(
+                    keyCode: event.keyCode,
+                    hasSelection: !selectedTranscriptions.isEmpty,
+                    isEditingText: isEditingText
+                )
+            else { return event }
 
+            if isShowingDeleted {
+                showPermanentDeleteConfirmation = true
+            } else {
+                showDeleteConfirmation = true
+            }
+            return nil
+        }
+    }
+
+    private func removeDeleteKeyMonitor() {
+        if let deleteKeyMonitor {
+            NSEvent.removeMonitor(deleteKeyMonitor)
+            self.deleteKeyMonitor = nil
+        }
+    }
+
+    private func clearSelectionState(for transcription: Transcription) {
         if selectedTranscription == transcription {
             selectedTranscription = nil
         }
         if selectionAnchor == transcription {
             selectionAnchor = nil
         }
-
         selectedTranscriptions.remove(transcription)
-        modelContext.delete(transcription)
+    }
+
+    private func performSoftDeletion(for transcription: Transcription) {
+        clearSelectionState(for: transcription)
+        TranscriptionTrashService.softDelete(transcription)
+    }
+
+    private func performRestore(for transcription: Transcription) {
+        clearSelectionState(for: transcription)
+        TranscriptionTrashService.restore(transcription)
+    }
+
+    private func performPermanentDeletion(for transcription: Transcription) {
+        clearSelectionState(for: transcription)
+        TranscriptionTrashService.permanentlyDelete(transcription, modelContext: modelContext)
     }
 
     private func saveAndReload() async {
@@ -498,12 +596,49 @@ struct TranscriptionHistoryView: View {
 
     private func deleteSelectedTranscriptions() {
         for transcription in selectedTranscriptions {
-            performDeletion(for: transcription)
+            performSoftDeletion(for: transcription)
         }
         selectedTranscriptions.removeAll()
 
         Task {
             await saveAndReload()
+        }
+    }
+
+    private func restoreSelectedTranscriptions() {
+        for transcription in selectedTranscriptions {
+            performRestore(for: transcription)
+        }
+        selectedTranscriptions.removeAll()
+
+        Task {
+            await saveAndReload()
+        }
+    }
+
+    private func permanentlyDeleteSelectedTranscriptions() {
+        for transcription in selectedTranscriptions {
+            performPermanentDeletion(for: transcription)
+        }
+        selectedTranscriptions.removeAll()
+
+        Task {
+            await saveAndReload()
+        }
+    }
+
+    private func emptyRecentlyDeleted() {
+        Task {
+            do {
+                let descriptor = FetchDescriptor<Transcription>(predicate: TranscriptionTrashService.deletedPredicate())
+                let items = try modelContext.fetch(descriptor)
+                for transcription in items {
+                    performPermanentDeletion(for: transcription)
+                }
+                await saveAndReload()
+            } catch {
+                print("Error emptying Recently Deleted: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -537,11 +672,17 @@ struct TranscriptionHistoryView: View {
     private func selectAllTranscriptions() async {
         do {
             var allDescriptor = FetchDescriptor<Transcription>()
+            let showingDeleted = isShowingDeleted
 
             if !searchText.isEmpty {
                 allDescriptor.predicate = #Predicate<Transcription> { transcription in
-                    transcription.text.localizedStandardContains(searchText)
-                        || (transcription.enhancedText?.localizedStandardContains(searchText) ?? false)
+                    (transcription.deletedAt != nil) == showingDeleted
+                        && (transcription.text.localizedStandardContains(searchText)
+                            || (transcription.enhancedText?.localizedStandardContains(searchText) ?? false))
+                }
+            } else {
+                allDescriptor.predicate = #Predicate<Transcription> { transcription in
+                    (transcription.deletedAt != nil) == showingDeleted
                 }
             }
 

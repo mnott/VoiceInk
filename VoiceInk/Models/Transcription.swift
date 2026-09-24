@@ -40,6 +40,11 @@ final class Transcription {
     /// is rendered from this via `MeetingSpeakerTranscriptRenderer`, not edited directly, once it
     /// is present.
     var meetingTurnsData: Data?
+    /// Non-`nil` once the record has been moved to "Recently Deleted" - the record and its audio
+    /// are kept (see `TranscriptionTrashService`) until it is restored or purged after
+    /// `TranscriptionTrashService.retentionDays`. `nil` for every pre-existing record, lightweight-
+    /// migration safe the same way `isMeetingRecording` is.
+    var deletedAt: Date?
 
     var meetingTurns: [MeetingTurnRecord]? {
         get { meetingTurnsData.flatMap { try? JSONDecoder().decode([MeetingTurnRecord].self, from: $0) } }

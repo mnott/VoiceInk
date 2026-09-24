@@ -26,6 +26,11 @@ class TranscriptionAutoCleanupService {
             object: nil
         )
 
+        Task { [weak self] in
+            guard let self = self else { return }
+            await self.purgeExpiredTrash(modelContext: modelContext)
+        }
+
         if UserDefaults.standard.bool(forKey: CleanupSettingsKeys.isTranscriptionCleanupEnabled) {
             Task { [weak self] in
                 guard let self = self, let modelContext = self.modelContext else { return }
@@ -44,6 +49,13 @@ class TranscriptionAutoCleanupService {
     }
 
     @objc private func handleTranscriptionCompleted(_ notification: Notification) {
+        if let modelContext = self.modelContext {
+            Task { [weak self] in
+                guard let self = self else { return }
+                await self.purgeExpiredTrash(modelContext: modelContext)
+            }
+        }
+
         let isEnabled = UserDefaults.standard.bool(forKey: CleanupSettingsKeys.isTranscriptionCleanupEnabled)
         guard isEnabled else { return }
 
@@ -65,17 +77,9 @@ class TranscriptionAutoCleanupService {
             return
         }
 
-        if let urlString = transcription.audioFileURL,
-            let url = URL(string: urlString)
-        {
-            do {
-                try FileManager.default.removeItem(at: url)
-            } catch {
-                logger.error("Failed to delete audio file: \(error, privacy: .public)")
-            }
-        }
-
-        modelContext.delete(transcription)
+        // Retention "Immediately" still goes through Recently Deleted, not a hard delete - see
+        // TranscriptionTrashService.
+        TranscriptionTrashService.softDelete(transcription)
 
         do {
             try modelContext.save()
@@ -83,6 +87,12 @@ class TranscriptionAutoCleanupService {
         } catch {
             logger.error("Failed to save after transcription deletion: \(error, privacy: .public)")
         }
+    }
+
+    private func purgeExpiredTrash(modelContext: ModelContext) async {
+        let modelContainer = await MainActor.run { modelContext.container }
+        let backgroundContext = ModelContext(modelContainer)
+        TranscriptionTrashService.purgeExpired(modelContext: backgroundContext)
     }
 
     private func sweepOldTranscriptions(modelContext: ModelContext) async {
@@ -102,19 +112,13 @@ class TranscriptionAutoCleanupService {
 
             let descriptor = FetchDescriptor<Transcription>(
                 predicate: #Predicate<Transcription> { transcription in
-                    transcription.timestamp < cutoffDate
+                    transcription.timestamp < cutoffDate && transcription.deletedAt == nil
                 }
             )
             let items = try backgroundContext.fetch(descriptor)
             var deletedCount = 0
             for transcription in items {
-                if let urlString = transcription.audioFileURL,
-                    let url = URL(string: urlString),
-                    FileManager.default.fileExists(atPath: url.path)
-                {
-                    try? FileManager.default.removeItem(at: url)
-                }
-                backgroundContext.delete(transcription)
+                TranscriptionTrashService.softDelete(transcription)
                 deletedCount += 1
             }
             if deletedCount > 0 {
@@ -161,6 +165,9 @@ class TranscriptionAutoCleanupService {
             var deletedCount = 0
             for fileURL in filesInDirectory {
                 let fileName = fileURL.lastPathComponent
+                // Recently Deleted's own subfolder is not an orphan file - its retention is
+                // TranscriptionTrashService.purgeExpired, not this sweep.
+                guard fileName != TranscriptionTrashService.trashDirectoryName else { continue }
                 if !referencedFiles.contains(fileName) {
                     try? FileManager.default.removeItem(at: fileURL)
                     deletedCount += 1

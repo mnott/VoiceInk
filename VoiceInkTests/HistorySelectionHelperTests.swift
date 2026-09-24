@@ -1,3 +1,4 @@
+import Carbon.HIToolbox
 import Testing
 @testable import VoiceInk
 
@@ -67,5 +68,63 @@ struct HistorySelectionHelperTests {
     @Test func selectAllOverFilteredListOnlyIncludesVisibleItems() {
         let filtered = [2, 4]
         #expect(HistorySelectionHelper.selectAll(visibleItems: filtered) == [2, 4])
+    }
+}
+
+// MARK: - History: Delete key decision logic
+
+struct HistoryDeleteKeyHandlerTests {
+    @Test func deleteKeyWithSelectionAndNoTextEditingRequestsDelete() {
+        #expect(
+            HistoryDeleteKeyHandler.shouldRequestDelete(
+                keyCode: UInt16(kVK_Delete), hasSelection: true, isEditingText: false))
+    }
+
+    @Test func forwardDeleteKeyWithSelectionAndNoTextEditingRequestsDelete() {
+        #expect(
+            HistoryDeleteKeyHandler.shouldRequestDelete(
+                keyCode: UInt16(kVK_ForwardDelete), hasSelection: true, isEditingText: false))
+    }
+
+    @Test func deleteKeyWithoutSelectionDoesNotRequestDelete() {
+        #expect(
+            !HistoryDeleteKeyHandler.shouldRequestDelete(
+                keyCode: UInt16(kVK_Delete), hasSelection: false, isEditingText: false))
+    }
+
+    @Test func deleteKeyWhileEditingTextDoesNotRequestDelete() {
+        #expect(
+            !HistoryDeleteKeyHandler.shouldRequestDelete(
+                keyCode: UInt16(kVK_Delete), hasSelection: true, isEditingText: true))
+    }
+
+    @Test func unrelatedKeyDoesNotRequestDelete() {
+        #expect(
+            !HistoryDeleteKeyHandler.shouldRequestDelete(
+                keyCode: UInt16(kVK_ANSI_A), hasSelection: true, isEditingText: false))
+    }
+}
+
+// MARK: - History: pluralised delete confirmation messages
+
+struct HistoryDeleteMessageTests {
+    @Test func softDeleteMessageUsesSingularForOne() {
+        #expect(HistoryDeleteMessage.softDelete(count: 1) == "1 item will be moved to Recently Deleted.")
+    }
+
+    @Test func softDeleteMessageUsesPluralForMultiple() {
+        #expect(HistoryDeleteMessage.softDelete(count: 3) == "3 items will be moved to Recently Deleted.")
+    }
+
+    @Test func permanentDeleteMessageUsesSingularForOne() {
+        #expect(
+            HistoryDeleteMessage.permanentDelete(count: 1)
+                == "This action cannot be undone. Permanently delete 1 item?")
+    }
+
+    @Test func permanentDeleteMessageUsesPluralForMultiple() {
+        #expect(
+            HistoryDeleteMessage.permanentDelete(count: 5)
+                == "This action cannot be undone. Permanently delete 5 items?")
     }
 }

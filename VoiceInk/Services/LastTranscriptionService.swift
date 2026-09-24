@@ -5,6 +5,7 @@ class LastTranscriptionService: ObservableObject {
 
     static func getLastTranscription(from modelContext: ModelContext) -> Transcription? {
         var descriptor = FetchDescriptor<Transcription>(
+            predicate: TranscriptionTrashService.visiblePredicate(),
             sortBy: [SortDescriptor(\.timestamp, order: .reverse)]
         )
         descriptor.fetchLimit = 1

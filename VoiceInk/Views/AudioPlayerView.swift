@@ -663,10 +663,11 @@ struct AudioPlayerView: View {
         isIdentifyingSpeakers = true
         let meetingID = transcription.id
         Task {
-            let systemChannel = (try? MeetingRecordingWriter.readChannels(from: url))?.system ?? []
+            let channels = (try? MeetingRecordingWriter.readChannels(from: url)) ?? (mic: [], system: [])
             let library = speakerLibrary
             let updatedTurns = await MeetingSpeakerIdentifier.rediarizeAndAssignSpeakers(
-                turns: existingTurns, systemChannel: systemChannel, meetingID: meetingID, library: library)
+                turns: existingTurns, systemChannel: channels.system, micChannel: channels.mic,
+                meetingID: meetingID, library: library)
 
             await MainActor.run {
                 transcription.meetingTurns = updatedTurns
@@ -703,7 +704,9 @@ struct AudioPlayerView: View {
 
         isRetranscribing = true
         operationFeedback = nil
-        let isMeetingRecording = transcription?.isMeetingRecording ?? false
+        // Detected from the file itself, not `transcription?.isMeetingRecording` - a record
+        // recovered by re-importing its audio after an accidental delete won't have that flag set.
+        let isMeetingRecording = MeetingAudioDetector.isMeetingLayout(url: url)
 
         Task {
             do {

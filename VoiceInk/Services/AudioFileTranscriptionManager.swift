@@ -128,6 +128,9 @@ class AudioTranscriptionManager: ObservableObject {
             modelContext: modelContext
         )
 
+        let accessing = item.url.startAccessingSecurityScopedResource()
+        defer { if accessing { item.url.stopAccessingSecurityScopedResource() } }
+
         do {
             guard
                 let transcriptionConfiguration = ModeRuntimeResolver.transcriptionConfiguration(
@@ -139,15 +142,26 @@ class AudioTranscriptionManager: ObservableObject {
             }
             let currentModel = transcriptionConfiguration.model
 
+            // A file in the Meeting Capture layout (regardless of where it came from) gets the
+            // two-channel, speaker-labelled treatment instead of being downmixed to mono - see
+            // `MeetingAudioDetector`.
+            if MeetingAudioDetector.isMeetingLayout(url: item.url) {
+                item.status = .processing(phase: .transcribing)
+                let meetingService = AudioTranscriptionService(modelContext: modelContext, engine: engine)
+                let result = try await meetingService.retranscribeMeetingAudio(from: item.url, using: currentModel)
+                item.transcription = result.transcription
+                item.status = .completed
+                lastCompletedItemId = item.id
+                await serviceRegistry.cleanup()
+                return
+            }
+
             // Phase: Loading
             item.status = .processing(phase: .loading)
             try Task.checkCancellation()
 
             // Phase: Processing Audio
             item.status = .processing(phase: .processingAudio)
-
-            let accessing = item.url.startAccessingSecurityScopedResource()
-            defer { if accessing { item.url.stopAccessingSecurityScopedResource() } }
 
             let samples = try await audioProcessor.processAudioToSamples(item.url)
             try Task.checkCancellation()
