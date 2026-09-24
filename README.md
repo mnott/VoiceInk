@@ -26,6 +26,7 @@
 >
 > - **Pinned destination** - Pin whatever you can type into right now with a shortcut, and every later dictation lands there without stealing focus, so you can read and work elsewhere while dictating into it. Works with an iTerm2 pane addressed by its session id, or with a focused text field in any app. A pinned iTerm2 pane can be tinted (colour and opacity of your choosing) so you can tell at a glance which one it is; the original background colour is captured first and always put back.
 > - **Per-application delivery options** - Per-app control over what happens when dictated text arrives: switch the app into typing mode first, submit with Return afterwards, and whether to leave a trailing space so you can keep dictating. These apply to normal dictation as well as to a pinned destination, and an explicit per-app rule overrides the app-wide preferences.
+> - **Meeting Capture** - While in a physical or an online meeting, you can use VoiceInk to capture the meeting content with automated speaker identification. And with the previously mentioned option to Pin the transcript into a given iTerm2 Session, you can have a meeting companion sitting next to you and advising you while the meeting is running.
 >
 > ![Pinned destination and delivery options in Settings](docs/images/pinned-destination-settings.png)
 >
