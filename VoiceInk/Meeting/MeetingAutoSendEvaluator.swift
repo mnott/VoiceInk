@@ -70,19 +70,57 @@ enum MeetingAutoSendEvaluator {
         state.inSpeech ? state.speechStart : nil
     }
 
+    /// Below this little pending audio ahead of an open region, an automatic cut's delivery is
+    /// starvation rather than a chunk - see `cutBoundary`'s fallback.
+    static let minAutomaticReleaseSamples = Int(1.0 * MeetingVAD.sampleRate)
+
     /// Where `MeetingAudioCapture.cut()` should stop releasing pending audio, as a local index
     /// into the chunk-pending buffer (`chunkPendingBaseOffset` translates each channel's global
     /// `openRegionStart` into that buffer's coordinates). `.max` releases everything - either
     /// because the caller forced it (session stop, nothing left to defer to) or because neither
     /// channel has an utterance open right now. Otherwise the smaller of the two channels' open
     /// starts, so a whole in-progress utterance on either channel is held back rather than split.
+    ///
+    /// Passing `pendingAudio` (what `cut()` has queued) adds a starvation fallback for that
+    /// deferral: a length-cap trigger (`MeetingAutoSendPolicy.maximumSecondsSinceLastChunk`) can
+    /// fire while the open utterance spans the whole pending buffer - continuous speech, or a
+    /// steady noise floor holding the VAD open - and plain deferral would then deliver nothing
+    /// at all, with the pending buffer growing without bound. In that case the cut lands at the
+    /// longest pause both channels share inside the open region (nobody talking on either side;
+    /// the same "split at the longest internal pause" idea as `MeetingTurnBuilder.cap`), or, if
+    /// the speech genuinely never pauses, at the pending end - a length trigger must never
+    /// release nothing. A normal deferral (a real chunk of closed speech ahead of the open tail,
+    /// i.e. a boundary at or beyond `minAutomaticReleaseSamples`) is unaffected.
     static func cutBoundary(
         micVADState: MeetingVAD.State, systemVADState: MeetingVAD.State,
-        chunkPendingBaseOffset: Int, forceFullRelease: Bool
+        chunkPendingBaseOffset: Int, forceFullRelease: Bool,
+        pendingAudio: (mic: [Int16], system: [Int16]) = ([], [])
     ) -> Int {
         guard !forceFullRelease else { return .max }
         let micBoundary = openRegionStart(micVADState).map { max(0, $0 - chunkPendingBaseOffset) } ?? .max
         let systemBoundary = openRegionStart(systemVADState).map { max(0, $0 - chunkPendingBaseOffset) } ?? .max
-        return min(micBoundary, systemBoundary)
+        let boundary = min(micBoundary, systemBoundary)
+        let pendingCount = min(pendingAudio.mic.count, pendingAudio.system.count)
+        guard boundary < minAutomaticReleaseSamples, boundary < pendingCount else { return boundary }
+
+        // ponytail: pauses are detected against MeetingVAD.absoluteFloor, not each channel's
+        // adaptive floor - on a loud-floor mic (calibrated or not) no pause may qualify and the
+        // fallback degrades to the hard cut; reuse MeetingVAD's own floor logic if that bites.
+        let scanRange = boundary..<pendingCount
+        let minPause = MeetingTurnBuilder.minInternalPauseSamples
+        let micRuns = MeetingVAD.silenceRuns(in: pendingAudio.mic, range: scanRange, minRunSamples: minPause)
+        let systemRuns = MeetingVAD.silenceRuns(in: pendingAudio.system, range: scanRange, minRunSamples: minPause)
+        var sharedRuns: [Range<Int>] = []
+        for micRun in micRuns {
+            for systemRun in systemRuns {
+                let start = max(micRun.lowerBound, systemRun.lowerBound)
+                let end = min(micRun.upperBound, systemRun.upperBound)
+                if end - start >= minPause { sharedRuns.append(start..<end) }
+            }
+        }
+        if let longest = sharedRuns.max(by: { $0.count < $1.count }) {
+            return (longest.lowerBound + longest.upperBound) / 2
+        }
+        return pendingCount
     }
 }

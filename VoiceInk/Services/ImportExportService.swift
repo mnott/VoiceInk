@@ -207,9 +207,11 @@ class ImportExportService {
 
             meetingCaptureShortcut: ShortcutStore.shortcut(for: .meetingCapture).map(ShortcutBackup.init),
             meetingChunkShortcut: ShortcutStore.shortcut(for: .meetingChunk).map(ShortcutBackup.init),
+            nameSpeakerShortcut: ShortcutStore.shortcut(for: .nameSpeaker).map(ShortcutBackup.init),
 
             meetingCaptureShortcuts: Self.shortcutBackups(for: .meetingCapture),
             meetingChunkShortcuts: Self.shortcutBackups(for: .meetingChunk),
+            nameSpeakerShortcuts: Self.shortcutBackups(for: .nameSpeaker),
 
             sendMeetingChunksAutomatically: UserDefaults.standard.bool(
                 forKey: PinnedDestinationSettingsKeys.sendMeetingChunksAutomatically)

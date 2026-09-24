@@ -113,13 +113,15 @@ struct GeneralBackup: Codable {
 
     let meetingCaptureShortcut: ShortcutBackup?
     let meetingChunkShortcut: ShortcutBackup?
+    let nameSpeakerShortcut: ShortcutBackup?
 
-    // All bindings (0..n) for the two meeting actions - see `ShortcutStore`. The singular fields
+    // All bindings (0..n) for the meeting actions - see `ShortcutStore`. The singular fields
     // above still carry the first binding for anything reading an older-format backup; these
-    // carry the rest. Both are optional so a backup written before multiple bindings existed
-    // still imports.
+    // carry the rest. All are optional so a backup written before multiple bindings (or before
+    // `nameSpeaker` existed) still imports.
     let meetingCaptureShortcuts: [ShortcutBackup]?
     let meetingChunkShortcuts: [ShortcutBackup]?
+    let nameSpeakerShortcuts: [ShortcutBackup]?
 
     let sendMeetingChunksAutomatically: Bool?
 }

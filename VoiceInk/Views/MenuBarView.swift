@@ -20,7 +20,11 @@ struct MenuBarView: View {
     @ObservedObject var audioDeviceManager = AudioDeviceManager.shared
     @ObservedObject private var pinnedDestinationManager = PinnedDestinationManager.shared
     @AppStorage("hasCompletedOnboardingV2") private var hasCompletedOnboardingV2 = false
+    @AppStorage(PinnedDestinationSettingsKeys.diarizeMicInPerson) private var diarizeMicInPerson = false
     @State private var launchAtLoginEnabled = LaunchAtLogin.isEnabled
+    // ShortcutStore is not observable; bump this so recorded hotkeys in the Meeting
+    // submenu refresh when a binding changes (same pattern as the Settings rows).
+    @State private var shortcutBindingsRevision = 0
 
     var body: some View {
         VStack {
@@ -29,6 +33,9 @@ struct MenuBarView: View {
             } else {
                 onboardingMenu
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: ShortcutStore.shortcutDidChange)) { _ in
+            shortcutBindingsRevision += 1
         }
     }
 
@@ -64,6 +71,17 @@ struct MenuBarView: View {
                     pinnedDestinationManager.unpin(notify: true)
                 }
             }
+
+            if engine.isMeetingCaptureActive, !engine.currentMeetingSpeakerLabel.isEmpty {
+                Divider()
+
+                Text(String(format: String(localized: "Speaking: %@"), engine.currentMeetingSpeakerLabel))
+                    .foregroundColor(.secondary)
+            }
+
+            Divider()
+
+            meetingMenu
 
             Divider()
 
@@ -178,6 +196,75 @@ struct MenuBarView: View {
                 NSApplication.shared.terminate(nil)
             }
         }
+    }
+
+    // Always visible: doubles as a hotkey reference even while capture is off.
+    private var meetingMenu: some View {
+        Menu {
+            Button {
+                Task { await engine.toggleMeetingCapture() }
+            } label: {
+                Text(
+                    "Meeting Capture"
+                        + (engine.isMeetingCaptureActive ? " (Active)" : "")
+                        + meetingHotkeyHint(for: .meetingCapture)
+                )
+            }
+
+            Button {
+                Task { await engine.sendMeetingChunk() }
+            } label: {
+                Text("Send Meeting Chunk" + meetingHotkeyHint(for: .meetingChunk))
+            }
+            .disabled(!engine.isMeetingCaptureActive)
+
+            Button {
+                engine.calibrateMeetingSilence()
+            } label: {
+                Text("Calibrate Silence" + meetingHotkeyHint(for: .calibrateMeetingSilence))
+            }
+            .disabled(!engine.isMeetingCaptureActive)
+
+            Button {
+                NameSpeakerManager.shared.toggle(engine: engine)
+            } label: {
+                Text("Name Speaker" + meetingHotkeyHint(for: .nameSpeaker))
+            }
+            .disabled(!engine.isMeetingCaptureActive)
+
+            Divider()
+
+            // Hybrid capture: with this on, an in-person meeting's room speakers are diarized on
+            // the mic channel while remote participants keep being diarized on the system channel
+            // (see `MeetingCaptureModeDetector`). Decided once at capture start - hence locked
+            // while a session is running.
+            Toggle("Diarize Microphone (Room Speakers)", isOn: $diarizeMicInPerson)
+                .disabled(engine.isMeetingCaptureActive)
+            if engine.isMeetingCaptureActive {
+                Text("Applies to the next meeting")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        } label: {
+            HStack {
+                Image(systemName: "record.circle")
+                    .font(.system(size: 11, weight: .medium))
+                Text("Meeting")
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.system(size: 10))
+            }
+        }
+    }
+
+    /// Recorded global hotkeys for an action, right-aligned by space padding (a plain
+    /// HStack label collapses inside a Menu). Empty when the action is unbound.
+    private func meetingHotkeyHint(for action: ShortcutAction) -> String {
+        _ = shortcutBindingsRevision
+
+        let shortcuts = ShortcutStore.shortcuts(for: action)
+        guard !shortcuts.isEmpty else { return "" }
+
+        return "    " + shortcuts.map(\.displayString).joined(separator: ", ")
     }
 
     private func showMainWindow(reason: String) {

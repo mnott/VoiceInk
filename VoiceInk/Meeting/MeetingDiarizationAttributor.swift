@@ -10,10 +10,15 @@ import Foundation
 enum MeetingDiarizationAttributor {
     struct Attribution: Equatable {
         /// Diarized speaker segments landing in this chunk, in chunk-local sample coordinates.
+        /// A chunk whose tail the diarizer hadn't committed by cut time (see
+        /// `coveredThroughSample`'s doc comment) has its last region's `end` extended through the
+        /// chunk boundary instead of leaving a gap - a continuation of that same speaker, not a
+        /// new, generically-labelled turn (see `attribute`'s doc comment).
         let regions: [(speaker: Int, start: Int, end: Int)]
-        /// Local sample offset the diarizer had committed through as of this chunk's cut - the
-        /// remaining tail `[coveredThroughSample, chunkLength)` is this chunk's own audio the
-        /// diarizer hasn't processed yet, and needs a VAD fallback (see `MeetingTurnTranscriber`).
+        /// Local sample offset the diarizer had committed through as of this chunk's cut -
+        /// diagnostic only, the remaining tail `[coveredThroughSample, chunkLength)` is this
+        /// chunk's own audio the diarizer hasn't processed yet. Always equal to the chunk length
+        /// (fully covered) whenever `regions` is non-empty - see `attribute`'s doc comment.
         let coveredThroughSample: Int
 
         static func == (lhs: Attribution, rhs: Attribution) -> Bool {
@@ -31,6 +36,18 @@ enum MeetingDiarizationAttributor {
     ///     probabilities for, as of this cut.
     ///   - chunkStartGlobal / chunkEndGlobal: This chunk's absolute sample window; consecutive
     ///     calls for the same session must supply contiguous, non-overlapping windows in order.
+    ///
+    /// A chunk's tail the diarizer hasn't committed by cut time (`MeetingAudioCapture` waits a
+    /// bounded amount of time for this before cutting - see its `diarizationCommitWaitSeconds` -
+    /// but streaming/offline latency, or a diarizer failure mid-session, can still leave a
+    /// shortfall) is handled two ways: if this chunk has at least one attributed remote-speaker
+    /// region, the last one's `end` is extended through the chunk boundary - a continuation of
+    /// that speaker, since real speaker turns run several seconds while the uncommitted tail is
+    /// normally at most a few - rather than the caller splitting it into its own generic "Others"
+    /// turn. Only a chunk with no attributed region at all reports the real shortfall via
+    /// `coveredThroughSample` - diagnostic only: what actually gets transcribed is always decided
+    /// by the caller's own VAD regions (see `MeetingDiarizationLabeler`), regardless of how much of
+    /// a chunk diarization has reached.
     static func attribute(
         segments: [(speaker: Int, start: Int, end: Int)],
         reportedThroughSample: Int,
@@ -45,8 +62,16 @@ enum MeetingDiarizationAttributor {
             regions.append((segment.speaker, start - chunkStartGlobal, end - chunkStartGlobal))
         }
 
+        let chunkLength = chunkEndGlobal - chunkStartGlobal
         let coveredThroughGlobal = max(chunkStartGlobal, min(committedThroughSample, chunkEndGlobal))
-        let attribution = Attribution(regions: regions, coveredThroughSample: coveredThroughGlobal - chunkStartGlobal)
+        var coveredThroughSample = coveredThroughGlobal - chunkStartGlobal
+
+        if coveredThroughSample < chunkLength, !regions.isEmpty {
+            regions[regions.count - 1].end = chunkLength
+            coveredThroughSample = chunkLength
+        }
+
+        let attribution = Attribution(regions: regions, coveredThroughSample: coveredThroughSample)
         return (attribution, chunkEndGlobal)
     }
 }

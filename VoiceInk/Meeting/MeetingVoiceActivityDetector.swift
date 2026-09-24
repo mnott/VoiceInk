@@ -25,6 +25,11 @@ enum MeetingVAD {
 
     struct State: Equatable {
         var noiseFloor: Double
+        /// Session minimum for the classified floor, pinned by a "This Is Silence" calibration
+        /// (see `MeetingAudioCapture.calibrateSilence`): the adaptive `noiseFloor` may sit above
+        /// or decay below it, but classification always uses the larger of the two, until a fresh
+        /// session starts back at 0.
+        var pinnedNoiseFloor: Double = 0
         var inSpeech = false
         var speechStart = 0
         /// Sample index right after the last frame that was voiced - carried across block
@@ -50,6 +55,15 @@ enum MeetingVAD {
     // noise floor has drifted, so true silence never gets misread as speech.
     static let absoluteFloor: Double = 150
     static let marginAboveNoiseFloor: Double = 200
+    // A flat additive margin is only ~+2 dB on a loud-floor mic (an AirPods Max headset on a
+    // train sits at ~650-1000 RMS in *pauses*), so pause frames kept clearing the threshold and
+    // every pause read as speech. The margin therefore also scales with the floor (+4.9 dB at
+    // 0.75), keeping pauses below threshold on loud floors; below ~267 RMS the additive term
+    // still dominates and quiet-mic behaviour is unchanged. Calibration (see
+    // `MeetingAudioCapture.calibrateSilence`) is what feeds the floor the ambient level in the
+    // first place when the channel never sees real silence - no automatic adaptation can tell a
+    // loud steady room from loud steady speech (see the stuck-speech nudge's doc comment).
+    static let relativeMarginAboveNoiseFloor: Double = 0.75
     static let noiseFloorAdaptRate: Double = 0.05
     // How long a non-speech, below-threshold run must last before it counts as confirmed silence
     // the floor is allowed to adapt to - shorter than this and it's just a gap between words or
@@ -72,6 +86,21 @@ enum MeetingVAD {
         guard !samples.isEmpty else { return 0 }
         let sumSquares = samples.reduce(0.0) { $0 + Double($1) * Double($1) }
         return (sumSquares / Double(samples.count)).squareRoot()
+    }
+
+    /// The noise level of a calibration window (the "This Is Silence" action): the 90th
+    /// percentile of its 20 ms frame energies, so a short blip (a cough, a door) inside the
+    /// otherwise-quiet window can't drag the calibrated floor up with it.
+    static func calibrationLevel(_ samples: [Int16]) -> Double {
+        var energies: [Double] = []
+        var i = 0
+        while i + frameSamples <= samples.count {
+            energies.append(rms(samples[i..<i + frameSamples]))
+            i += frameSamples
+        }
+        guard !energies.isEmpty else { return 0 }
+        energies.sort()
+        return energies[Int(0.9 * Double(energies.count - 1))]
     }
 
     /// Processes one block of samples. Returns regions that closed (500 ms of trailing silence
@@ -141,7 +170,8 @@ enum MeetingVAD {
         _ state: inout State, energy: Double, absoluteStart: Int, processedEnd: Int,
         regions: inout [Region], utteranceGrowthSamples: inout Int
     ) {
-        let threshold = max(absoluteFloor, state.noiseFloor + marginAboveNoiseFloor)
+        let floor = max(state.noiseFloor, state.pinnedNoiseFloor)
+        let threshold = max(absoluteFloor, floor + max(marginAboveNoiseFloor, floor * relativeMarginAboveNoiseFloor))
 
         if energy >= threshold {
             let newLastVoicedEnd = absoluteStart + frameSamples

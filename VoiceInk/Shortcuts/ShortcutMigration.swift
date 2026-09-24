@@ -275,7 +275,7 @@ enum ShortcutMigration {
             return []
         // Introduced after the legacy KeyboardShortcuts storage was retired, so
         // there is nothing to migrate from.
-        case .pinDestination, .meetingCapture, .meetingChunk:
+        case .pinDestination, .meetingCapture, .meetingChunk, .nameSpeaker, .calibrateMeetingSilence:
             return []
         }
     }

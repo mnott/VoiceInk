@@ -257,4 +257,45 @@ struct MeetingVADTests {
             maxSilenceDuringUtterance < MeetingAutoSendPolicy.requiredTrailingSilenceSeconds,
             "no dip inside the utterance must look like a genuine trailing pause")
     }
+
+    // MARK: - Bug: loud steady ambient (headset mic in a train) never reads as silence
+
+    @Test func aCalibratedFloorStillClassifiesPausesAsSilenceAfterLongLoudSpeech() {
+        // The stuck-speech nudge decays `noiseFloor` back toward `absoluteFloor` during long
+        // misread "speech"; the calibration pin must keep the *classified* floor up, so
+        // pause-level ambience (RMS ~700, louder than absoluteFloor + margin) still reads as
+        // silence after 20 s of loud speech.
+        var state = MeetingVAD.State(noiseFloor: 900)
+        state.pinnedNoiseFloor = 900
+        (_, _, state) = MeetingVAD.process(Self.tone(seconds: 20, amplitude: 6000), state: state)
+        #expect(state.noiseFloor < 400, "the adaptive floor does decay during speech - that's what the pin is for")
+
+        (_, _, state) = MeetingVAD.process(Self.tone(seconds: 3, amplitude: 990), state: state)  // RMS ~= 700
+        #expect(!state.inSpeech, "pause-level ambience must not reopen speech")
+        #expect(state.confirmedSilenceRunFrames >= MeetingVAD.confirmedSilenceFrames, "the pause must confirm as silence")
+    }
+
+    @Test func withoutThePinADecayedFloorLetsTheAmbienceBackInAsSpeech() {
+        // Same scenario, no pin: the decayed floor drops the threshold below the ambient level
+        // and the pause reads as speech again - the failure the pin exists to prevent.
+        var state = MeetingVAD.State(noiseFloor: 900)
+        (_, _, state) = MeetingVAD.process(Self.tone(seconds: 20, amplitude: 6000), state: state)
+        #expect(state.noiseFloor < 400)
+
+        (_, _, state) = MeetingVAD.process(Self.tone(seconds: 3, amplitude: 990), state: state)
+        #expect(state.inSpeech, "documents why calibration pins the floor instead of only seeding it")
+    }
+
+    @Test func calibrationLevelIsTheQuietLevelEvenWhenTheWindowContainsABlip() {
+        // 2 s of quiet ambience (RMS ~= 354) with a 150 ms loud blip inside: the 90th-percentile
+        // frame energy must land on the ambience, not the blip (RMS ~= 5657).
+        let quiet = Self.tone(seconds: 2.0, amplitude: 500)
+        let blipStart = Int(1.0 * Self.sampleRate)
+        var window = quiet
+        window.replaceSubrange(blipStart..<blipStart + Int(0.15 * Self.sampleRate), with: Self.tone(seconds: 0.15, amplitude: 8000))
+
+        let level = MeetingVAD.calibrationLevel(window)
+        #expect(level > 250, "must measure the ambience itself, not silence")
+        #expect(level < 1000, "a short blip must not drag the calibrated floor up")
+    }
 }

@@ -47,17 +47,22 @@ struct SpeakerLibrarySettingsView: View {
                 .buttonStyle(.plain)
                 .disabled(voice.sampleClipFileNames.isEmpty)
 
-                TextField(
-                    "Name",
-                    text: Binding(
-                        get: { voice.name ?? "" },
-                        set: { newValue in
-                            SpeakerLibraryService.rename(id: voice.id, to: newValue, library: library, modelContext: modelContext)
-                        })
-                )
-                .textFieldStyle(.roundedBorder)
+                NameField(voice: voice, library: library, modelContext: modelContext)
 
                 Text(voice.id).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
+
+                Toggle(
+                    "This is me",
+                    isOn: Binding(
+                        get: { voice.isMe },
+                        set: { library.setIsMe(id: voice.id, isMe: $0) }
+                    )
+                )
+                .toggleStyle(.checkbox)
+                .controlSize(.small)
+                .help(
+                    "Flag this voice as you, so Meeting Capture's in-person mode (diarizing the microphone instead of a call's system audio) can label your own turns \"Me\" instead of a speaker id. Only one voice can be flagged at a time."
+                )
 
                 Menu("Merge Into…") {
                     ForEach(sortedVoices.filter { $0.id != voice.id }) { target in
@@ -94,5 +99,50 @@ struct SpeakerLibrarySettingsView: View {
         guard let fileName = voice.sampleClipFileNames.first else { return }
         player = try? AVAudioPlayer(contentsOf: library.clipURL(for: fileName))
         player?.play()
+    }
+}
+
+/// Rename field for one voice. Deliberately does NOT persist on every keystroke: it edits a local
+/// draft and commits (via `SpeakerLibraryService.rename`, which also re-renders every meeting that
+/// references this voice - not cheap enough to run per character) only on Return or on losing
+/// keyboard focus. Editing on every keystroke previously left the field armed to silently overwrite
+/// a voice's name with whatever stray text (e.g. dictation typed at the cursor elsewhere) reached it
+/// next, for as long as Return - which does not resign focus - left it the first responder.
+private struct NameField: View {
+    let voice: SpeakerVoice
+    let library: SpeakerLibraryStore
+    let modelContext: ModelContext
+
+    @State private var draft: String
+    @FocusState private var isFocused: Bool
+
+    init(voice: SpeakerVoice, library: SpeakerLibraryStore, modelContext: ModelContext) {
+        self.voice = voice
+        self.library = library
+        self.modelContext = modelContext
+        _draft = State(initialValue: voice.name ?? "")
+    }
+
+    var body: some View {
+        TextField("Name", text: $draft)
+            .textFieldStyle(.roundedBorder)
+            .focused($isFocused)
+            .onSubmit(commit)
+            .onChange(of: isFocused) { _, focused in
+                guard !focused else { return }
+                commit()
+            }
+            .onChange(of: voice.name) { _, newValue in
+                // A rename that landed some other way (merge, a live match during Meeting
+                // Capture) while this field isn't the one being edited - reflect it here too,
+                // but never clobber text the user is actively typing.
+                guard !isFocused else { return }
+                draft = newValue ?? ""
+            }
+    }
+
+    private func commit() {
+        guard let value = SpeakerLibraryService.valueToPersist(draft: draft, currentName: voice.name) else { return }
+        SpeakerLibraryService.rename(id: voice.id, to: value, library: library, modelContext: modelContext)
     }
 }

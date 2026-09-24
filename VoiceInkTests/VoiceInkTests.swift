@@ -664,14 +664,31 @@ struct NormalDeliveryRuleLookupTests {
 
 struct PinnedDestinationITermDeliveryStepsTests {
     private let textLiteral = "\"hello\""
+    private let bracketedStart = "(character id 27) & \"[200~\""
+    private let bracketedEnd = "(character id 27) & \"[201~\""
+
+    private var bracketedTextStatement: String {
+        "write text (\(bracketedStart) & \(textLiteral) & \(bracketedEnd)) newline no"
+    }
 
     @Test func plainDeliveryIsJustTheTextWrite() {
         let steps = PinnedDestinationManager.iTermDeliverySteps(
             textLiteral: textLiteral, sendInsertPrefix: false)
         #expect(steps.count == 1)
-        #expect(steps[0].statement == "write text \(textLiteral) newline no")
+        #expect(steps[0].statement == bracketedTextStatement)
         #expect(steps[0].role == .text)
         #expect(steps[0].settleDelaySeconds == 0)
+    }
+
+    @Test func textStepIsWrappedInBracketedPasteMarkers() {
+        // A TUI that isn't reading its input promptly (busy running a tool) must see the
+        // whole chunk as ONE paste, not a stream of individual keystrokes - see the doc
+        // comment on `bracketedPasteStartExpression`.
+        let steps = PinnedDestinationManager.iTermDeliverySteps(
+            textLiteral: textLiteral, sendInsertPrefix: false)
+        #expect(steps[0].statement.contains("character id 27"))
+        #expect(steps[0].statement.contains("[200~"))
+        #expect(steps[0].statement.contains("[201~"))
     }
 
     @Test func writeStepsNeverContainACarriageReturn() {
@@ -698,7 +715,7 @@ struct PinnedDestinationITermDeliveryStepsTests {
         #expect(steps[0].statement == "write text (\"i\" & (character id 127)) newline no")
         #expect(steps[0].role == .insertModePrefix)
         #expect(steps[0].settleDelaySeconds > 0)
-        #expect(steps[1].statement == "write text \(textLiteral) newline no")
+        #expect(steps[1].statement == bracketedTextStatement)
         #expect(steps[1].role == .text)
         #expect(steps[1].settleDelaySeconds == 0)
     }
@@ -1107,8 +1124,9 @@ struct SettingsBackupPinnedDestinationFieldsTests {
             appendTrailingSpace: false, isExperimentalFeaturesEnabled: nil, restoreClipboardAfterPaste: nil,
             clipboardRestoreDelay: nil, pinDestinationShortcut: nil, pinnedDestinationEnterRules: rules,
             highlightPinnedITermSession: true, pinnedITermTintColorHex: "112233FF",
-            meetingCaptureShortcut: nil, meetingChunkShortcut: nil,
-            meetingCaptureShortcuts: nil, meetingChunkShortcuts: nil, sendMeetingChunksAutomatically: nil
+            meetingCaptureShortcut: nil, meetingChunkShortcut: nil, nameSpeakerShortcut: nil,
+            meetingCaptureShortcuts: nil, meetingChunkShortcuts: nil, nameSpeakerShortcuts: nil,
+            sendMeetingChunksAutomatically: nil
         )
 
         let data = try JSONEncoder().encode(general)
@@ -1514,8 +1532,8 @@ struct SettingsBackupMeetingShortcutFieldsTests {
             appendTrailingSpace: nil, isExperimentalFeaturesEnabled: nil, restoreClipboardAfterPaste: nil,
             clipboardRestoreDelay: nil, pinDestinationShortcut: nil, pinnedDestinationEnterRules: nil,
             highlightPinnedITermSession: nil, pinnedITermTintColorHex: nil,
-            meetingCaptureShortcut: meetingCaptureShortcut, meetingChunkShortcut: nil,
-            meetingCaptureShortcuts: meetingCaptureShortcuts, meetingChunkShortcuts: nil,
+            meetingCaptureShortcut: meetingCaptureShortcut, meetingChunkShortcut: nil, nameSpeakerShortcut: nil,
+            meetingCaptureShortcuts: meetingCaptureShortcuts, meetingChunkShortcuts: nil, nameSpeakerShortcuts: nil,
             sendMeetingChunksAutomatically: sendMeetingChunksAutomatically
         )
     }

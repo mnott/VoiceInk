@@ -19,10 +19,14 @@ struct PinnedDestinationSettingsSection: View {
     private var sendMeetingChunksAutomatically = false
     @AppStorage(PinnedDestinationSettingsKeys.identifyRemoteSpeakers)
     private var identifyRemoteSpeakers = true
+    @AppStorage(PinnedDestinationSettingsKeys.diarizeMicInPerson)
+    private var diarizeMicInPerson = false
 
     @State private var meetingShortcutBindingCounts: [ShortcutAction: Int] = [
         .meetingCapture: ShortcutStore.shortcuts(for: .meetingCapture).count,
         .meetingChunk: ShortcutStore.shortcuts(for: .meetingChunk).count,
+        .nameSpeaker: ShortcutStore.shortcuts(for: .nameSpeaker).count,
+        .calibrateMeetingSilence: ShortcutStore.shortcuts(for: .calibrateMeetingSilence).count,
     ]
     @State private var pendingMeetingShortcutSlots: [ShortcutAction: Int] = [:]
 
@@ -235,6 +239,8 @@ struct PinnedDestinationSettingsSection: View {
             Section {
                 meetingShortcutRow(action: .meetingCapture, title: "Toggle Meeting Capture")
                 meetingShortcutRow(action: .meetingChunk, title: "Send Meeting Chunk")
+                meetingShortcutRow(action: .nameSpeaker, title: "Name Speaker")
+                meetingShortcutRow(action: .calibrateMeetingSilence, title: "Calibrate Silence")
 
                 Toggle("Send Chunks Automatically", isOn: $sendMeetingChunksAutomatically)
                     .toggleStyle(.switch)
@@ -249,18 +255,26 @@ struct PinnedDestinationSettingsSection: View {
                     .help(
                         "Label each remote participant separately (\"Speaker 1\", \"Speaker 2\", ...) instead of one shared \"Others\" label, once the Nemotron 3 Diarization model is downloaded from the AI Models page. Uses extra CPU/Neural Engine time while a meeting is running."
                     )
+
+                Toggle("In-Person Meeting (Diarize Microphone)", isOn: $diarizeMicInPerson)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .help(
+                        "Split the microphone into individually labelled speakers instead of treating the whole channel as you - for an in-person meeting where everyone shares this Mac's mic. Turns on automatically whenever there is no System Audio Recording tap to diarize instead, so this toggle is only needed to force it on even when there is one (e.g. a call app is open in the background but nobody remote is actually talking)."
+                    )
             } header: {
                 Text("Meeting Capture")
             } footer: {
                 Text(
-                    "Records the microphone and everything your Mac plays - the other participants in a Teams/Zoom call, for example - without muting or pausing the call. Each press of Send Meeting Chunk transcribes the audio captured since the last press and delivers it to the pinned destination (or the cursor) while recording keeps running. macOS asks once for System Audio Recording permission the first time you use this. Echo cancellation removes what the speakers played back out of the microphone recording, so the other participants are not captured twice even without headphones. Either action can have more than one shortcut - useful for pairing a keyboard combo with a mouse button combo. Download the Nemotron 3 Diarization model on the AI Models page to identify remote speakers individually instead of one shared \"Others\" label."
+                    "Records the microphone and everything your Mac plays - the other participants in a Teams/Zoom call, for example - without muting or pausing the call. Each press of Send Meeting Chunk transcribes the audio captured since the last press and delivers it to the pinned destination (or the cursor) while recording keeps running. macOS asks once for System Audio Recording permission the first time you use this. Echo cancellation removes what the speakers played back out of the microphone recording, so the other participants are not captured twice even without headphones. Any action can have more than one shortcut - useful for pairing a keyboard combo with a mouse button combo. Download the Nemotron 3 Diarization model on the AI Models page to identify remote speakers individually instead of one shared \"Others\" label; once downloaded, Name Speaker opens a small text field to name whichever remote speaker talked most recently, with autocomplete against the speaker library. For an in-person meeting with everyone on this Mac's mic, the same model splits the microphone into individual speakers instead (see In-Person Meeting above) - mark one voice \"This is me\" in Settings -> Speakers so your own turns render as \"Me\" instead of a speaker id. While Meeting Capture is running, VoiceInk keeps your Mac from sleeping on its own - but closing the lid still sleeps it regardless, unless it's on power with an external display attached (clamshell mode) or system sleep is disabled entirely from Terminal with `sudo pmset -a disablesleep 1` (revert with `sudo pmset -a disablesleep 0`); VoiceInk never runs this for you."
                 )
                 .font(.caption)
                 .foregroundColor(.secondary)
             }
             .onReceive(NotificationCenter.default.publisher(for: ShortcutStore.shortcutDidChange)) { notification in
                 guard let action = notification.object as? ShortcutAction,
-                    action == .meetingCapture || action == .meetingChunk
+                    action == .meetingCapture || action == .meetingChunk || action == .nameSpeaker
+                        || action == .calibrateMeetingSilence
                 else {
                     return
                 }

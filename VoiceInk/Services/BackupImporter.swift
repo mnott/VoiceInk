@@ -237,6 +237,9 @@ enum BackupImporter {
         importMeetingShortcuts(
             action: .meetingChunk, bindings: general.meetingChunkShortcuts,
             singleBinding: general.meetingChunkShortcut)
+        importMeetingShortcuts(
+            action: .nameSpeaker, bindings: general.nameSpeakerShortcuts,
+            singleBinding: general.nameSpeakerShortcut)
 
         if let sendChunksAutomatically = general.sendMeetingChunksAutomatically {
             UserDefaults.standard.set(

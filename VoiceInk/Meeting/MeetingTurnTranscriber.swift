@@ -14,13 +14,17 @@ enum MeetingTurnTranscriber {
     ///     for the whole-meeting transcript's (`MeetingRecordingTranscriber`) first super-block;
     ///     later super-blocks seed from the ending floor this function returns.
     ///   - systemNoiseFloor: Same, for the system-audio channel.
-    ///   - systemDiarization: This chunk/super-block's diarized "Others" turns (see
+    ///   - systemDiarization: This chunk/super-block's diarized speaker segments (see
     ///     `MeetingDiarizer`/`MeetingDiarizationAttributor`), or `nil` when speaker identification
     ///     isn't running this session - the pre-diarization behaviour, plain VAD on `system`
-    ///     labelled with the single generic "Others". When non-nil, only the portion of `system`
-    ///     the diarizer hasn't committed yet (`coveredThroughSample...`, normally at most a few
-    ///     seconds - streaming/offline latency) falls back to VAD, generically labelled; the rest
-    ///     is exactly the diarizer's own speaker segments.
+    ///     labelled with the single generic "Others". When non-nil, `system`'s own VAD regions -
+    ///     unchanged from the pre-diarization behaviour, so nothing VAD hears is ever dropped just
+    ///     because the diarizer didn't cover it - are labelled by diarizer overlap instead (see
+    ///     `MeetingDiarizationLabeler`).
+    ///   - micDiarization: Same idea as `systemDiarization` but for the mic channel, in an
+    ///     in-person meeting (see `MeetingCaptureModeDetector`) - splits `mic` into `.otherMic`
+    ///     speakers instead of the pre-in-person "whole channel is `.me`" behaviour. `nil` (the
+    ///     default) keeps that pre-in-person behaviour.
     /// - Returns: The transcribed turns, plus the noise floor each channel ended on - so a caller
     ///   stitching several calls together over one file/session can seed the next one with it
     ///   instead of starting over at 0 (see
@@ -30,20 +34,28 @@ enum MeetingTurnTranscriber {
         model: any TranscriptionModel, requestContext: TranscriptionRequestContext,
         serviceRegistry: TranscriptionServiceRegistry,
         micNoiseFloor: Double = 0, systemNoiseFloor: Double = 0,
-        systemDiarization: MeetingAudioCapture.SystemDiarization? = nil
+        systemDiarization: MeetingAudioCapture.SystemDiarization? = nil,
+        micDiarization: MeetingAudioCapture.MicDiarization? = nil
     ) async -> (turns: [MeetingTurnTranscriptRenderer.TranscribedTurn], micNoiseFloor: Double, systemNoiseFloor: Double) {
-        let (meRegions, endingMicNoiseFloor) = MeetingVAD.regionsAndEndingNoiseFloor(for: mic, startingNoiseFloor: micNoiseFloor)
-        let (othersRegions, othersSpeakers, endingSystemNoiseFloor) = Self.othersRegionsAndSpeakers(
-            system: system, systemNoiseFloor: systemNoiseFloor, systemDiarization: systemDiarization)
-        let turns = MeetingTurnBuilder.build(
+        let (meRegions, meSpeakers, endingMicNoiseFloor) = Self.diarizedRegionsAndSpeakers(
+            channel: mic, noiseFloor: micNoiseFloor, diarization: micDiarization,
+            speakerForSlot: { .otherMic($0) }, uncommittedTailSpeaker: .othersMic)
+        let (othersRegions, othersSpeakers, endingSystemNoiseFloor) = Self.diarizedRegionsAndSpeakers(
+            channel: system, noiseFloor: systemNoiseFloor, diarization: systemDiarization,
+            speakerForSlot: { .other($0) }, uncommittedTailSpeaker: .others)
+        let builtTurns = MeetingTurnBuilder.build(
             meRegions: meRegions, othersRegions: othersRegions, meSamples: mic, othersSamples: system,
-            othersSpeakers: othersSpeakers)
+            meSpeakers: meSpeakers, othersSpeakers: othersSpeakers)
+        // Re-joins same-speaker turns `build()`'s own length cap split apart, purely for this
+        // clip-per-turn transcription loop - see `mergeAdjacentSameSpeakerForTranscription`'s doc
+        // comment for why the split itself stays untouched.
+        let turns = MeetingTurnBuilder.mergeAdjacentSameSpeakerForTranscription(builtTurns)
 
         var results: [MeetingTurnTranscriptRenderer.TranscribedTurn] = []
         // Serial, not concurrent: the local Whisper model is not safe to run two transcriptions
         // at once.
         for turn in turns {
-            let source = turn.speaker == .me ? mic : system
+            let source = turn.speaker.isMicChannel ? mic : system
             guard turn.start < turn.end, turn.end <= source.count else { continue }
 
             let clip = MeetingAudioCapture.padded(
@@ -51,41 +63,30 @@ enum MeetingTurnTranscriber {
             let text = await transcribedText(
                 for: clip, model: model, requestContext: requestContext, serviceRegistry: serviceRegistry)
             let filtered = TranscriptionOutputFilter.filter(text).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !filtered.isEmpty else { continue }
+            // Drops punctuation-only interjections ("-", "...") that VAD/diarization still turn
+            // into a labelled turn but that carry no actual words.
+            guard filtered.rangeOfCharacter(from: .alphanumerics) != nil else { continue }
 
             results.append(.init(speaker: turn.speaker, text: filtered, start: turn.start, end: turn.end))
         }
         return (MeetingEchoSafetyNet.filter(results), endingMicNoiseFloor, endingSystemNoiseFloor)
     }
 
-    /// Builds `MeetingTurnBuilder.build`'s `othersRegions`/`othersSpeakers` pair: purely diarized
-    /// when `systemDiarization` covers the whole buffer, a merge of the diarized regions plus a
-    /// VAD fallback over the not-yet-committed tail when it only covers part of it, or plain VAD
-    /// (the pre-diarization behaviour) when `systemDiarization` is `nil`.
-    private static func othersRegionsAndSpeakers(
-        system: [Int16], systemNoiseFloor: Double, systemDiarization: MeetingAudioCapture.SystemDiarization?
+    /// Builds `MeetingTurnBuilder.build`'s `meRegions`/`meSpeakers` or `othersRegions`/
+    /// `othersSpeakers` pair for one channel: `channel`'s own VAD regions always decide WHAT gets
+    /// transcribed; the diarizer (when running) only decides WHO, via `MeetingDiarizationLabeler`.
+    private static func diarizedRegionsAndSpeakers(
+        channel: [Int16], noiseFloor: Double, diarization: MeetingDiarizationAttributor.Attribution?,
+        speakerForSlot: (Int) -> MeetingTurnBuilder.Speaker, uncommittedTailSpeaker: MeetingTurnBuilder.Speaker
     ) -> (regions: [MeetingVAD.Region], speakers: [MeetingTurnBuilder.Speaker]?, endingNoiseFloor: Double) {
-        guard let systemDiarization else {
-            let (regions, floor) = MeetingVAD.regionsAndEndingNoiseFloor(for: system, startingNoiseFloor: systemNoiseFloor)
-            return (regions, nil, floor)
+        let (vadRegions, floor) = MeetingVAD.regionsAndEndingNoiseFloor(for: channel, startingNoiseFloor: noiseFloor)
+        guard let diarization else {
+            return (vadRegions, nil, floor)
         }
-
-        var regions = systemDiarization.regions.map { MeetingVAD.Region(start: $0.start, end: $0.end) }
-        var speakers = systemDiarization.regions.map { MeetingTurnBuilder.Speaker.other($0.speaker) }
-
-        let coveredThrough = systemDiarization.coveredThroughSample
-        if coveredThrough < system.count {
-            let tail = Array(system[coveredThrough...])
-            let tailRegions = MeetingVAD.regions(for: tail, startingNoiseFloor: systemNoiseFloor)
-            for region in tailRegions {
-                regions.append(MeetingVAD.Region(start: region.start + coveredThrough, end: region.end + coveredThrough))
-                speakers.append(.others)
-            }
-        }
-        // Noise floor from a VAD-fallback tail (at most a few seconds) isn't worth threading
-        // through as the session's system noise floor - keep seeding future chunks from the value
-        // the caller already had.
-        return (regions, speakers, systemNoiseFloor)
+        let (regions, speakers) = MeetingDiarizationLabeler.label(
+            vadRegions: vadRegions, diarizedSegments: diarization.regions, samples: channel,
+            speakerForSlot: speakerForSlot, noSpeaker: uncommittedTailSpeaker)
+        return (regions, speakers, floor)
     }
 
     private static func transcribedText(

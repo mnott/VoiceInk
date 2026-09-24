@@ -25,22 +25,55 @@ enum MeetingRecordingTranscriber {
     /// `MeetingTurnRecord`s (diarized slot set where diarization ran, `speakerID` always `nil` -
     /// see `MeetingSpeakerIdentifier` for that step). Callers render `text` themselves via
     /// `MeetingSpeakerTranscriptRenderer` once speaker identification has run.
+    ///
+    /// - Parameters:
+    ///   - existingDiarizer: The live session's own (already-finished) system-channel diarizer,
+    ///     when this is the note written right after `toggleMeetingCapture()` stops - reused
+    ///     instead of a second offline-profile pass over the same audio, since the session already
+    ///     ran the streaming profile continuously over the whole system channel in the same global
+    ///     sample coordinates as this recording (`MeetingAudioCapture.absorbAndWrite` appends the
+    ///     identical `system` samples, in the identical order, to both). `nil` for History
+    ///     re-transcribe / an imported meeting file, which has no live session to reuse and falls
+    ///     back to a fresh offline-profile pass, per this file's proof
+    ///     (`MeetingDiarizationOfflineProofTests`) showing it labels at least as well as streaming.
+    ///   - existingMicDiarizer: Same idea as `existingDiarizer` but for the mic channel, when the
+    ///     live session ran in-person mode (see `MeetingCaptureMode`). `nil` otherwise.
     static func transcribe(
         stereoURL: URL,
         model: any TranscriptionModel,
         requestContext: TranscriptionRequestContext,
-        serviceRegistry: TranscriptionServiceRegistry
+        serviceRegistry: TranscriptionServiceRegistry,
+        existingDiarizer: MeetingDiarizer? = nil,
+        existingMicDiarizer: MeetingDiarizer? = nil
     ) async -> [MeetingTurnRecord] {
         guard let reader = MeetingRecordingWriter.ChannelReader(url: stereoURL) else { return [] }
         defer { reader.close() }
 
-        // One continuous offline-profile session for the whole recording (see `MeetingDiarizer`'s
-        // doc comment) - `nil` (silent fallback to the single "Others" label) unless the setting
-        // is on and the model is downloaded; never triggers a download itself.
-        let diarizer: MeetingDiarizer? =
-            UserDefaults.standard.bool(forKey: PinnedDestinationSettingsKeys.identifyRemoteSpeakers)
-            ? await MeetingDiarizer.makeIfAvailable(config: MeetingDiarizationModels.offlineConfig)
-            : nil
+        let diarizer: MeetingDiarizer?
+        if let existingDiarizer {
+            // Already fed every sample live and `finish()`ed by `MeetingAudioCapture.stop()` -
+            // further `append`/`finish` calls below are no-ops (see `MeetingDiarizer.append`'s
+            // guard). Only the attribution watermark needs resetting, since the live session's
+            // own per-chunk delivery already advanced it through the whole recording.
+            existingDiarizer.resetAttributionWatermark()
+            diarizer = existingDiarizer
+        } else {
+            // One continuous offline-profile session for the whole recording (see `MeetingDiarizer`'s
+            // doc comment) - `nil` (silent fallback to the single "Others" label) unless the setting
+            // is on and the model is downloaded; never triggers a download itself.
+            diarizer =
+                UserDefaults.standard.bool(forKey: PinnedDestinationSettingsKeys.identifyRemoteSpeakers)
+                ? await MeetingDiarizer.makeIfAvailable(config: MeetingDiarizationModels.offlineConfig)
+                : nil
+        }
+
+        let micDiarizer: MeetingDiarizer?
+        if let existingMicDiarizer {
+            existingMicDiarizer.resetAttributionWatermark()
+            micDiarizer = existingMicDiarizer
+        } else {
+            micDiarizer = nil
+        }
 
         var allTurns: [MeetingTurnRecord] = []
         var micAcc: [Int16] = []
@@ -51,20 +84,34 @@ enum MeetingRecordingTranscriber {
         var systemNoiseFloor: Double = 0
         var systemGlobalOffset = 0
 
-        func flush() async {
+        // `alreadyAppended` lets the final call below hand its trailing audio to the diarizer
+        // itself, ahead of `finish()`, without this appending it a second time.
+        func flush(alreadyAppended: Bool = false) async {
             guard !micAcc.isEmpty else { return }
 
             var diarization: MeetingAudioCapture.SystemDiarization? = nil
             if let diarizer {
-                diarizer.append(systemAcc)
+                if !alreadyAppended {
+                    diarizer.append(systemAcc)
+                }
                 diarization = diarizer.attribute(
                     chunkStartGlobal: systemGlobalOffset, chunkEndGlobal: systemGlobalOffset + systemAcc.count)
+            }
+            var micDiarization: MeetingAudioCapture.MicDiarization? = nil
+            if let micDiarizer {
+                if !alreadyAppended {
+                    micDiarizer.append(micAcc)
+                }
+                // Mic and system are read in lockstep (see below), so `systemGlobalOffset` is this
+                // super-block's start in either channel's own global sample coordinates.
+                micDiarization = micDiarizer.attribute(
+                    chunkStartGlobal: systemGlobalOffset, chunkEndGlobal: systemGlobalOffset + micAcc.count)
             }
 
             let result = await MeetingTurnTranscriber.transcribe(
                 mic: micAcc, system: systemAcc, model: model, requestContext: requestContext,
                 serviceRegistry: serviceRegistry, micNoiseFloor: micNoiseFloor, systemNoiseFloor: systemNoiseFloor,
-                systemDiarization: diarization)
+                systemDiarization: diarization, micDiarization: micDiarization)
             // Mic and system are read in lockstep from the same stereo file, so one running offset
             // (this super-block's start, in samples since the meeting began) applies to both
             // channels' turns - see `MeetingTurnRecord.init(_:globalOffset:)`.
@@ -85,11 +132,20 @@ enum MeetingRecordingTranscriber {
                 await flush()
             }
         }
-        // Flushes the diarizer's trailing partial chunk before the final super-block's flush()
-        // attributes it - the whole recording's last few seconds of "Others" speech would
-        // otherwise never be committed.
+        // The last super-block's audio must reach the diarizer (`append`) before `finish()` -
+        // `Nemotron3Diarizer.appendAudio` traps once the stream is finished. `finish()` then
+        // flushes the trailing partial chunk so the final `flush()`'s `attribute()` call (which
+        // must skip re-appending what was just appended here) sees it, instead of losing the
+        // whole recording's last few seconds of "Others" speech.
+        if let diarizer, !systemAcc.isEmpty {
+            diarizer.append(systemAcc)
+        }
+        if let micDiarizer, !micAcc.isEmpty {
+            micDiarizer.append(micAcc)
+        }
         diarizer?.finish()
-        await flush()
+        micDiarizer?.finish()
+        await flush(alreadyAppended: true)
 
         return allTurns
     }

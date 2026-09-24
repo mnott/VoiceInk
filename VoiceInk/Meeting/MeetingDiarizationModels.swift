@@ -1,3 +1,4 @@
+import CoreML
 import FluidAudio
 import Foundation
 
@@ -9,6 +10,15 @@ import Foundation
 enum MeetingDiarizationModels {
     static let offlineConfig = Nemotron3Config.offline
     static let streamingConfig = Nemotron3Config.fast32
+
+    /// `offline`'s compiled model is GPU-only (FluidAudio's own model card notes an ANE compiler
+    /// limit for it - see `Documentation/Diarization/Nemotron3.md`): loading it with the default
+    /// `.all` compute units routes it to ANE anyway, and CoreML throws "Output backing ... not
+    /// compatible with the model's output feature description" instead of falling back to GPU.
+    /// `streamingConfig` (`fast32`) has no such restriction and keeps the ANE-eligible default.
+    static func computeUnits(for config: Nemotron3Config) -> MLComputeUnits {
+        config.modelFileName == offlineConfig.modelFileName ? .cpuAndGPU : .all
+    }
 
     static var cacheDirectory: URL {
         let fm = FileManager.default

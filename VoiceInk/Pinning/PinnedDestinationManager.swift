@@ -866,6 +866,23 @@ final class PinnedDestinationManager: ObservableObject {
     /// source.
     private static let insertModePrefixStatement = "write text (\"i\" & (character id 127)) newline no"
 
+    /// ESC[200~ / ESC[201~ - the terminal "bracketed paste" markers, built via `character id 27`
+    /// for the same reason `insertModePrefixStatement` does: a raw ESC byte cannot be embedded in
+    /// AppleScript source. Wrapping the dictated text between them makes a bracketed-paste-aware
+    /// reader (the shell, readline, or a TUI framework) consume the whole chunk as ONE paste event
+    /// instead of a stream of individual keystrokes.
+    ///
+    /// Observed live 2026-09-24: a long, multi-speaker chunk delivered as bare keystrokes to a busy
+    /// TUI (a CLI tool mid-run, not reading its input promptly) arrived with only its TAIL intact -
+    /// most of the text, including every speaker label, was lost. That is consistent with a
+    /// keystroke-by-keystroke input loop that replaces its buffer on each read rather than
+    /// appending to it, which a single atomic paste read sidesteps entirely. Deliberately NOT
+    /// applied to `insertModePrefixStatement` above: that pair only works because a modal editor
+    /// reads it as two literal keystrokes (`i` then DEL) to flip mode - wrapped in bracketed paste,
+    /// a paste-aware target would insert `i<DEL>` as literal text instead of running it as a command.
+    private static let bracketedPasteStartExpression = "(character id 27) & \"[200~\""
+    private static let bracketedPasteEndExpression = "(character id 27) & \"[201~\""
+
     /// One step of an iTerm2 delivery sequence. Kept as data - not executed inline - so
     /// the ORDER and ROLE of each write is unit-testable without any live AppleScript
     /// or iTerm2 state; see `iTermDeliverySteps` and `decideITermDeliveryOutcome` below.
@@ -907,7 +924,7 @@ final class PinnedDestinationManager: ObservableObject {
 
         steps.append(
             ITermDeliveryStep(
-                statement: "write text \(textLiteral) newline no",
+                statement: "write text (\(bracketedPasteStartExpression) & \(textLiteral) & \(bracketedPasteEndExpression)) newline no",
                 role: .text,
                 settleDelaySeconds: 0
             ))

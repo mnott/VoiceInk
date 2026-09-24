@@ -2,17 +2,24 @@ import Foundation
 
 /// Text-level safety net for the acoustic echo `EchoCanceller` doesn't fully remove: when the far
 /// end's speech leaks into the mic loudly enough to be transcribed, the leaked words show up
-/// almost verbatim in the "Others" turn that's playing at (or just before/after) the same time.
-/// For every "Me" turn that time-overlaps an "Others" turn - allowing `overlapSlackSamples` of
-/// slack for the acoustic round-trip delay - strips any run of `minEchoRunWords` or more
-/// consecutive words the two share, after normalising case, punctuation and number words vs
-/// digits, and drops the "Me" turn entirely if fewer than `minRemainingWords` words survive.
-/// Genuine double-talk ("I agree, that's a good idea" spoken over the other side) is untouched
-/// because it shares no such run with what the other side is saying.
+/// almost verbatim - or as a slightly different ASR reading of the same audio - in the "Others"
+/// turn that's playing at (or just before/after) the same time. For every "Me" turn that
+/// time-overlaps an "Others" turn - allowing `overlapSlackSamples` of slack for the acoustic
+/// round-trip delay - two passes apply, both using fuzzy word equality (same normalised word, a
+/// shared leading stem of >= 4 chars, or a Levenshtein distance of <= 1 for words of length >= 4)
+/// so that ASR variants like "scans"/"scanner" or "drop"/"dropped" still count as the same word:
+/// short turns (<= `maxWholeTurnEchoWords` words) are dropped entirely if >= `wholeTurnEchoRatio`
+/// of their words fuzzy-match, in order, words in the overlapping Others text; longer turns keep
+/// the run-stripping, removing any run of `minEchoRunWords` or more consecutive fuzzy-matching
+/// words and dropping the turn if fewer than `minRemainingWords` words survive. Genuine
+/// double-talk ("I agree, that's a good idea" spoken over the other side) is untouched because it
+/// shares neither a run nor enough in-order fuzzy matches with what the other side is saying.
 enum MeetingEchoSafetyNet {
     static let overlapSlackSamples = Int(1.0 * MeetingVAD.sampleRate)
-    static let minEchoRunWords = 4
+    static let minEchoRunWords = 3
     static let minRemainingWords = 3
+    static let maxWholeTurnEchoWords = 8
+    static let wholeTurnEchoRatio = 0.6
 
     private static let numberWords: [String: String] = [
         "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6",
@@ -39,6 +46,13 @@ enum MeetingEchoSafetyNet {
             // run-length threshold.
             let othersWords = overlapping.flatMap { normalisedWords($0.text) }
             let meTokens = tokens(turn.text)
+
+            if meTokens.count <= maxWholeTurnEchoWords,
+                isMostlyEchoedSubsequence(meTokens.map(\.normalised), in: othersWords)
+            {
+                return nil
+            }
+
             let kept = stripEchoedRuns(meTokens, against: othersWords)
             guard kept.count >= minRemainingWords else { return nil }
 
@@ -75,12 +89,65 @@ enum MeetingEchoSafetyNet {
         var best = 0
         for j in othersWords.indices {
             var length = 0
-            while i + length < meWords.count, j + length < othersWords.count, meWords[i + length] == othersWords[j + length] {
+            while i + length < meWords.count, j + length < othersWords.count, fuzzyEqual(meWords[i + length], othersWords[j + length]) {
                 length += 1
             }
             best = max(best, length)
         }
         return best
+    }
+
+    /// True if `>= wholeTurnEchoRatio` of `meWords` fuzzy-match words in `othersWords`, in order
+    /// (a greedy in-order subsequence match - each Me word claims the next fuzzy-matching Others
+    /// word after the previous claim, so out-of-order coincidental matches don't count).
+    private static func isMostlyEchoedSubsequence(_ meWords: [String], in othersWords: [String]) -> Bool {
+        guard !meWords.isEmpty else { return false }
+        var searchFrom = 0
+        var matched = 0
+        for word in meWords {
+            // A word that matches nothing leaves `searchFrom` where it was, so it doesn't burn
+            // through the rest of `othersWords` and block later words from matching.
+            if let foundIndex = (searchFrom..<othersWords.count).first(where: { fuzzyEqual(word, othersWords[$0]) }) {
+                matched += 1
+                searchFrom = foundIndex + 1
+            }
+        }
+        return Double(matched) / Double(meWords.count) >= wholeTurnEchoRatio
+    }
+
+    /// Same normalised word, a shared leading stem of >= 4 chars, or one Levenshtein edit apart
+    /// for words of length >= 4 - catches ASR variants of the same leaked audio ("scans" vs
+    /// "scanner", "drop" vs "dropped") without conflating unrelated short words.
+    private static func fuzzyEqual(_ a: String, _ b: String) -> Bool {
+        if a == b { return true }
+        if commonPrefixLength(a, b) >= 4 { return true }
+        if a.count >= 4, b.count >= 4, levenshteinDistance(a, b) <= 1 { return true }
+        return false
+    }
+
+    private static func commonPrefixLength(_ a: String, _ b: String) -> Int {
+        var count = 0
+        for (ca, cb) in zip(a, b) {
+            guard ca == cb else { break }
+            count += 1
+        }
+        return count
+    }
+
+    private static func levenshteinDistance(_ a: String, _ b: String) -> Int {
+        let a = Array(a), b = Array(b)
+        var previous = Array(0...b.count)
+        var current = [Int](repeating: 0, count: b.count + 1)
+        for i in 1...a.count {
+            current[0] = i
+            for j in 1...b.count {
+                current[j] = a[i - 1] == b[j - 1]
+                    ? previous[j - 1]
+                    : 1 + min(previous[j - 1], previous[j], current[j - 1])
+            }
+            previous = current
+        }
+        return previous[b.count]
     }
 
     private static func tokens(_ text: String) -> [(original: String, normalised: String)] {

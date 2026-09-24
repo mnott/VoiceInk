@@ -63,6 +63,16 @@ struct IdentifySpeakersSheet: View {
                     "Name", text: Binding(get: { names[id] ?? "" }, set: { names[id] = $0 })
                 )
                 .textFieldStyle(.roundedBorder)
+
+                Toggle(
+                    "This is me",
+                    isOn: Binding(
+                        get: { library.voice(for: id)?.isMe ?? false },
+                        set: { library.setIsMe(id: id, isMe: $0) }
+                    )
+                )
+                .toggleStyle(.checkbox)
+                .controlSize(.small)
             }
 
             if !namedSuggestions.isEmpty {

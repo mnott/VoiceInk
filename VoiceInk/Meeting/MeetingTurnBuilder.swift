@@ -10,15 +10,34 @@ import Foundation
 enum MeetingTurnBuilder {
     /// `other(nil)` is the generic, undiarized "Others" - either diarization is unavailable/failed
     /// (see `MeetingDiarizer`), or a chunk's tail the diarizer hasn't committed yet. `other(i)` is
-    /// a diarized remote speaker slot (arrival-ordered, 0-based - "Speaker 1" is `other(0)`).
+    /// a diarized remote speaker slot (arrival-ordered, 0-based - "Speaker 1" is `other(0)`), read
+    /// from the *system* channel. `otherMic(i)` is the same idea but read from the *mic* channel -
+    /// a diarized speaker in an in-person meeting (see `MeetingCaptureModeDetector`) who hasn't
+    /// (yet, or ever) been matched to the library's "this is me" voice; `otherMic(nil)` is its
+    /// undiarized-tail fallback, mirroring `other(nil)`. A slot only ever renders as "Me" - never
+    /// as `otherMic` - once that live match happens (see `MeetingMicSpeakerMapper`); the turn
+    /// itself stays `otherMic` throughout, since which channel it reads from can't retroactively
+    /// change.
     enum Speaker: Equatable {
         case me
         case other(Int?)
+        case otherMic(Int?)
         static let others = Speaker.other(nil)
+        static let othersMic = Speaker.otherMic(nil)
 
         var isOther: Bool {
             if case .other = self { return true }
             return false
+        }
+
+        /// Whether this speaker's audio lives in the mic channel (`.me`, and in-person mic-diarized
+        /// speakers) rather than the system channel (`.other`, remote/call speakers) - used to pick
+        /// which channel's samples a turn's clip is sliced from.
+        var isMicChannel: Bool {
+            switch self {
+            case .me, .otherMic: return true
+            case .other: return false
+            }
         }
     }
 
@@ -30,20 +49,38 @@ enum MeetingTurnBuilder {
 
     private static let sampleRate = MeetingVAD.sampleRate
     static let interjectionToleranceSamples = Int(2.0 * sampleRate)
+    /// A region this long isn't a brief interjection ("yeah", "I agree") any more - splitting the
+    /// host to fit it in cuts the host's own speech into a clip with no natural lead-in right where
+    /// the interjector starts, and ASR reliably drops the opening word(s) of that clip. A sustained,
+    /// multi-second region overlapping the host is far more likely to be uncancelled acoustic echo
+    /// of the host's own words (see `MeetingEchoSafetyNet`) than someone actually cutting in for
+    /// that long, so it's still placed as its own turn (below, in the orphan pass) but never allowed
+    /// to split the host it landed inside.
+    static let maxSplittableInterjectorSamples = Int(3.0 * sampleRate)
     static let minInternalPauseSamples = Int(0.2 * sampleRate)
     static let mergeGapSamples = Int(1.0 * sampleRate)
     static let maxTurnSamples = Int(25 * sampleRate)
+    /// Gap `MeetingTurnTranscriber` re-merges same-speaker turns across for transcription only,
+    /// after `cap()` has already split a long turn at `maxTurnSamples` - see
+    /// `mergeAdjacentSameSpeakerForTranscription`'s doc comment.
+    static let transcriptionMergeGapSamples = Int(1.5 * sampleRate)
     /// Silence added to each side of a turn's audio clip before transcription (separate from,
     /// and larger than, `MeetingVAD.paddingSamples`, which pads a *region* with real captured
     /// audio rather than the clip sent to the transcription service with synthetic silence).
     static let transcriptionPaddingSamples = Int(0.2 * sampleRate)
 
-    /// - Parameter othersSpeakers: Per-`othersRegions`-element speaker label, e.g. from
-    ///   `MeetingDiarizer` (`.other(0)`, `.other(1)`, ...). `nil` (the default) or a short array
-    ///   keeps every region labelled the generic `.others` - the pre-diarization behaviour.
+    /// - Parameters:
+    ///   - meSpeakers: Per-`meRegions`-element speaker label, e.g. `.otherMic(0)`, `.otherMic(1)`,
+    ///     ... from mic-channel diarization in an in-person meeting. `nil` (the default) or a short
+    ///     array keeps every region labelled the generic `.me` - the pre-in-person behaviour (the
+    ///     whole mic channel is the user).
+    ///   - othersSpeakers: Per-`othersRegions`-element speaker label, e.g. from `MeetingDiarizer`
+    ///     (`.other(0)`, `.other(1)`, ...). `nil` (the default) or a short array keeps every region
+    ///     labelled the generic `.others` - the pre-diarization behaviour.
     static func build(
         meRegions: [MeetingVAD.Region], othersRegions: [MeetingVAD.Region],
         meSamples: [Int16], othersSamples: [Int16],
+        meSpeakers: [Speaker]? = nil,
         othersSpeakers: [Speaker]? = nil
     ) -> [Turn] {
         struct Placed {
@@ -51,6 +88,11 @@ enum MeetingTurnBuilder {
             let start: Int
             let end: Int
             let orderKey: Int
+        }
+
+        func meSpeaker(at index: Int) -> Speaker {
+            guard let meSpeakers, index < meSpeakers.count else { return .me }
+            return meSpeakers[index]
         }
 
         func othersSpeaker(at index: Int) -> Speaker {
@@ -77,6 +119,7 @@ enum MeetingTurnBuilder {
                 // pass below), just ordered by its own start rather than split precisely.
                 let interjectorIndex = interjectors.indices.first {
                     interjectorFlags[$0] && host.start <= interjectors[$0].start && interjectors[$0].start < host.end
+                        && interjectors[$0].end - interjectors[$0].start <= maxSplittableInterjectorSamples
                 }
                 guard let interjectorIndex else {
                     placed.append(Placed(speaker: hostSpeaker(index), start: host.start, end: host.end, orderKey: host.start))
@@ -111,17 +154,18 @@ enum MeetingTurnBuilder {
 
         placeHosts(
             othersRegions, hostFlags: othersIsInterjection, hostSpeaker: othersSpeaker, hostSamples: othersSamples,
-            interjectors: meRegions, interjectorFlags: meIsInterjection, interjectorSpeaker: { _ in .me })
+            interjectors: meRegions, interjectorFlags: meIsInterjection, interjectorSpeaker: meSpeaker)
         placeHosts(
-            meRegions, hostFlags: meIsInterjection, hostSpeaker: { _ in .me }, hostSamples: meSamples,
+            meRegions, hostFlags: meIsInterjection, hostSpeaker: meSpeaker, hostSamples: meSamples,
             interjectors: othersRegions, interjectorFlags: othersIsInterjection, interjectorSpeaker: othersSpeaker)
 
         // Interjection-flagged regions never visited as a host above (its own host was itself an
         // interjection, or it lost out to another interjector in the same host) still need a turn.
         for (index, region) in meRegions.enumerated() where meIsInterjection[index] {
-            let alreadyPlaced = placed.contains { $0.speaker == .me && $0.start == region.start && $0.end == region.end }
+            let speaker = meSpeaker(at: index)
+            let alreadyPlaced = placed.contains { $0.speaker == speaker && $0.start == region.start && $0.end == region.end }
             guard !alreadyPlaced else { continue }
-            placed.append(Placed(speaker: .me, start: region.start, end: region.end, orderKey: region.start))
+            placed.append(Placed(speaker: speaker, start: region.start, end: region.end, orderKey: region.start))
         }
         for (index, region) in othersRegions.enumerated() where othersIsInterjection[index] {
             let speaker = othersSpeaker(at: index)
@@ -132,13 +176,33 @@ enum MeetingTurnBuilder {
 
         let ordered = placed.sorted { $0.orderKey < $1.orderKey }.map { Turn(speaker: $0.speaker, start: $0.start, end: $0.end) }
         let merged = mergeAdjacentSameSpeaker(ordered)
-        return merged.flatMap { cap($0, samples: $0.speaker == .me ? meSamples : othersSamples) }
+        return merged.flatMap { cap($0, samples: $0.speaker.isMicChannel ? meSamples : othersSamples) }
     }
 
     private static func mergeAdjacentSameSpeaker(_ turns: [Turn]) -> [Turn] {
+        mergeAdjacentSameSpeaker(turns, maxGapSamples: mergeGapSamples)
+    }
+
+    /// `build()`'s own `cap()` step splits one continuous utterance into several same-speaker
+    /// turns purely to bound each turn's length (`maxTurnSamples`) - a concern about turn size,
+    /// not about where a sentence actually ends. Transcribing those pieces as separate clips
+    /// therefore starts and ends each one mid-sentence, and the ASR closes every clip with its own
+    /// sentence punctuation regardless, producing a stray period where the turn was cut rather
+    /// than where the speaker paused. `MeetingTurnTranscriber` calls this right before slicing
+    /// clips - after `build()`'s regions/labels/cap decisions are final - to re-join same-speaker
+    /// turns across the small (<=1.5s) gaps `cap()`'s own split (zero-gap) or a short natural pause
+    /// leaves, so the ASR sees one continuous clip again. This never grows a turn past what a
+    /// single chunk-hotkey cut or `MeetingRecordingTranscriber` super-block already bounds it to,
+    /// since every call site only ever passes turns built from one such chunk/super-block's own
+    /// samples in the first place.
+    static func mergeAdjacentSameSpeakerForTranscription(_ turns: [Turn]) -> [Turn] {
+        mergeAdjacentSameSpeaker(turns, maxGapSamples: transcriptionMergeGapSamples)
+    }
+
+    private static func mergeAdjacentSameSpeaker(_ turns: [Turn], maxGapSamples: Int) -> [Turn] {
         var result: [Turn] = []
         for turn in turns {
-            if let last = result.last, last.speaker == turn.speaker, turn.start - last.end <= mergeGapSamples {
+            if let last = result.last, last.speaker == turn.speaker, turn.start - last.end <= maxGapSamples {
                 result[result.count - 1] = Turn(speaker: last.speaker, start: last.start, end: turn.end)
             } else {
                 result.append(turn)

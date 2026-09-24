@@ -53,6 +53,13 @@ final class MeetingAudioCapture: @unchecked Sendable {
     // tap and its VAD region to close, before `cut(forceFullRelease: true)` releases everything
     // regardless - see `cutForManualSend`.
     static let manualCutDelaySeconds: TimeInterval = 0.6
+    // How long `cut()` waits for the streaming diarizer to commit through a chunk's end before
+    // cutting anyway - see `waitForDiarizerCommit`. Bounded so a stalled/slow diarizer session
+    // never delays chunk delivery indefinitely; a shortfall still remaining after this either
+    // continues the chunk's last diarized speaker or falls back to "Others" (see
+    // `MeetingDiarizationAttributor`), never blocks.
+    static let diarizationCommitWaitSeconds: TimeInterval = 1.5
+    static let diarizationCommitPollIntervalSeconds: TimeInterval = 0.1
     // Carries `MeetingVAD`'s adaptive noise floor and in-speech/hangover state across drain
     // ticks per channel. Always kept current (whether or not auto-send is on) since `cut()` also
     // needs it to know whether a chunk boundary would land inside an open utterance.
@@ -76,6 +83,43 @@ final class MeetingAudioCapture: @unchecked Sendable {
     /// Fired (on `tapQueue`) when the auto-send trigger fires; the caller is responsible for
     /// hopping to the actor it needs and delivering the chunk exactly like a manual one.
     var onAutoSendTrigger: (() -> Void)?
+
+    // MARK: - "This Is Silence" calibration
+
+    /// Armed by `calibrateSilence`, fed by `absorbAndWrite`, always on `tapQueue`: collects the
+    /// next 2 s of both channels, then pins their measured noise level as each channel's VAD
+    /// floor minimum for the rest of the session (see `MeetingVAD.State.pinnedNoiseFloor`).
+    private var silenceCalibration: (collector: SilenceCalibrationCollector, onCalibrated: @Sendable () -> Void)?
+
+    /// The user's answer to ambient noise a stationary VAD can't separate from speech on its own
+    /// (a train, a busy office): the NEXT 2 s of captured audio (per channel) is measured - the
+    /// 90th percentile of its 20 ms frame energies, so short blips don't count - and pinned as
+    /// that channel's VAD noise floor until the session ends. Next session starts fresh.
+    /// `onCalibrated` fires on `tapQueue` once the floors are set.
+    func calibrateSilence(onCalibrated: @escaping @Sendable () -> Void) {
+        tapQueue.async { [weak self] in
+            guard let self, !self.isStopped else { return }
+            self.silenceCalibration = (SilenceCalibrationCollector(), onCalibrated)
+            self.logger.notice("Meeting capture: silence calibration armed - measuring the next 2s of ambience")
+        }
+    }
+
+    /// Collects a fixed window of mic+system audio for one "This Is Silence" calibration.
+    struct SilenceCalibrationCollector {
+        static let windowSamples = Int(2.0 * MeetingVAD.sampleRate)
+        private var mic: [Int16] = []
+        private var system: [Int16] = []
+
+        /// Appends one drain tick's audio; returns the measured per-channel floors once the
+        /// window is full, `nil` while still collecting.
+        mutating func absorb(mic: [Int16], system: [Int16]) -> (micFloor: Double, systemFloor: Double)? {
+            guard self.mic.count < Self.windowSamples else { return nil }
+            self.mic += mic
+            self.system += system
+            guard self.mic.count >= Self.windowSamples else { return nil }
+            return (MeetingVAD.calibrationLevel(self.mic), MeetingVAD.calibrationLevel(self.system))
+        }
+    }
 
     // MARK: - Continuous meeting recording
 
@@ -114,10 +158,35 @@ final class MeetingAudioCapture: @unchecked Sendable {
     // until (if) the async load in `start()` completes, and forever if the model isn't downloaded,
     // the setting is off, or loading/streaming fails. Only ever touched on `tapQueue`.
     private var systemDiarizer: MeetingDiarizer?
+    /// Same idea as `systemDiarizer` but for the mic channel - only started when `captureMode` is
+    /// `.inPerson` (see `startMicDiarizerIfEnabled`).
+    private var micDiarizer: MeetingDiarizer?
+    /// Samples absorbed before `systemDiarizer`/`micDiarizer` attach - see
+    /// `MeetingDiarizerAttachBacklog`. Only ever touched on `tapQueue`, same as the diarizers
+    /// themselves.
+    private var systemDiarizerBacklog = MeetingDiarizerAttachBacklog()
+    private var micDiarizerBacklog = MeetingDiarizerAttachBacklog()
+    /// Set (on `tapQueue`) by `stop()` - a diarizer whose async load completes after this must not
+    /// be attached: it would sit unattributed and unflushed, and `finishedSystemDiarizer()`/
+    /// `finishedMicDiarizer()` may already have been called and answered by the time it lands.
+    private var isStopped = false
 
     /// Diarized "Others" turns for one `cut()`, chunk-local sample coordinates - see
     /// `MeetingDiarizationAttributor`. `nil` when diarization isn't running this session.
     typealias SystemDiarization = MeetingDiarizationAttributor.Attribution
+    /// Same underlying type as `SystemDiarization`, named separately for the mic channel's own
+    /// diarized speakers in an in-person meeting - see `MeetingCaptureMode`.
+    typealias MicDiarization = MeetingDiarizationAttributor.Attribution
+
+    /// Which channel this session diarizes into individual speakers - decided once, synchronously,
+    /// in `start()` (see `MeetingCaptureModeDetector`) and never re-evaluated mid-session.
+    private(set) var captureMode = MeetingCaptureMode.twoChannel
+
+    /// Acquire-on-start/release-on-stop-or-failure keep-awake assertion - see `MeetingKeepAwake`.
+    /// Lock-protected like `drainBuffer`/`isDictationActive` above: `start()`/`stop()` run on
+    /// whatever actor calls them (normally `@MainActor`, via `VoiceInkEngine+Meeting`) while a mic
+    /// failure is reported from `micSetupQueue`.
+    private let keepAwakeLock = OSAllocatedUnfairLock<MeetingKeepAwakeController>(initialState: MeetingKeepAwakeController())
 
     init(recordingURL: URL) {
         micOutputURL = FileManager.default.temporaryDirectory
@@ -142,12 +211,18 @@ final class MeetingAudioCapture: @unchecked Sendable {
         /// This cut's diarized "Others" turns, if speaker identification is running - see
         /// `SystemDiarization`.
         let systemDiarization: SystemDiarization?
+        /// This cut's diarized mic-channel speakers, if `captureMode` is `.inPerson` - see
+        /// `MicDiarization`.
+        let micDiarization: MicDiarization?
     }
 
     func start() {
         startMic()
         startSystemTap()
         echoCanceller = isCapturingSystemAudio ? EchoCanceller() : nil
+        captureMode = MeetingCaptureModeDetector.mode(
+            isCapturingSystemAudio: isCapturingSystemAudio,
+            forcedInPersonSetting: UserDefaults.standard.bool(forKey: PinnedDestinationSettingsKeys.diarizeMicInPerson))
         do {
             recordingWriter = try MeetingRecordingWriter(url: recordingURL)
         } catch {
@@ -156,6 +231,11 @@ final class MeetingAudioCapture: @unchecked Sendable {
         }
         startDrainTimer()
         startSystemDiarizerIfEnabled()
+        startMicDiarizerIfEnabled()
+        keepAwakeLock.withLock { $0.captureStarted() }
+        logger.notice(
+            "Meeting capture started: captureMode=\(String(describing: self.captureMode), privacy: .public) isCapturingSystemAudio=\(self.isCapturingSystemAudio, privacy: .public)"
+        )
     }
 
     func stop() {
@@ -168,8 +248,12 @@ final class MeetingAudioCapture: @unchecked Sendable {
         stopMic()
         stopSystemTap()
         tapQueue.sync {
+            self.isStopped = true
             self.finalDrainTick()
             self.systemDiarizer?.finish()
+            self.micDiarizer?.finish()
+            self.systemDiarizerBacklog.discard()
+            self.micDiarizerBacklog.discard()
         }
         do {
             try recordingWriter?.finish()
@@ -178,6 +262,20 @@ final class MeetingAudioCapture: @unchecked Sendable {
         }
         recordingWriter = nil
         echoCanceller = nil
+        keepAwakeLock.withLock { $0.captureEndedOrFailed() }
+    }
+
+    /// This session's finished diarizer, if speaker identification ran - call only after `stop()`
+    /// has returned (its `finish()` call happens synchronously on `tapQueue`), so the caller (the
+    /// whole-meeting note) sees a fully-flushed session instead of a mid-stream one.
+    func finishedSystemDiarizer() -> MeetingDiarizer? {
+        tapQueue.sync { self.systemDiarizer }
+    }
+
+    /// Same idea as `finishedSystemDiarizer` but for the mic channel - only non-`nil` when
+    /// `captureMode` was `.inPerson` and the mic diarizer loaded in time (see `micDiarizer`).
+    func finishedMicDiarizer() -> MeetingDiarizer? {
+        tapQueue.sync { self.micDiarizer }
     }
 
     /// Kicks off the (async) model load for live speaker identification, if system audio is being
@@ -189,10 +287,51 @@ final class MeetingAudioCapture: @unchecked Sendable {
         guard isCapturingSystemAudio,
             UserDefaults.standard.bool(forKey: PinnedDestinationSettingsKeys.identifyRemoteSpeakers)
         else { return }
+        // Synchronous, not `.async`: must be in effect before `start()` returns, so no sample
+        // absorbed after this point can be missed by the backlog while the model loads below.
+        tapQueue.sync { self.systemDiarizerBacklog.startCollecting() }
         Task { [weak self] in
             guard let diarizer = await MeetingDiarizer.makeIfAvailable(config: MeetingDiarizationModels.streamingConfig)
-            else { return }
-            self?.tapQueue.async { self?.systemDiarizer = diarizer }
+            else {
+                self?.tapQueue.async { self?.systemDiarizerBacklog.discard() }
+                return
+            }
+            self?.tapQueue.async {
+                guard let self, !self.isStopped else { return }
+                let backlog = self.systemDiarizerBacklog.drain()
+                if !backlog.isEmpty { diarizer.append(backlog) }
+                self.systemDiarizer = diarizer
+                self.logger.notice(
+                    "Meeting capture: system diarizer attached \(Date().timeIntervalSince(self.startedAt), privacy: .public)s after start, replaying \(Double(backlog.count) / self.mixdownFormat.sampleRate, privacy: .public)s backlog"
+                )
+            }
+        }
+    }
+
+    /// Same idea as `startSystemDiarizerIfEnabled` but for the mic channel, only in an in-person
+    /// meeting (see `captureMode`/`MeetingCaptureModeDetector`) - same model/settings toggle, same
+    /// silent fallback (the whole mic channel stays labelled "Me") if the model isn't downloaded or
+    /// loading fails.
+    private func startMicDiarizerIfEnabled() {
+        guard captureMode == .inPerson,
+            UserDefaults.standard.bool(forKey: PinnedDestinationSettingsKeys.identifyRemoteSpeakers)
+        else { return }
+        tapQueue.sync { self.micDiarizerBacklog.startCollecting() }
+        Task { [weak self] in
+            guard let diarizer = await MeetingDiarizer.makeIfAvailable(config: MeetingDiarizationModels.streamingConfig)
+            else {
+                self?.tapQueue.async { self?.micDiarizerBacklog.discard() }
+                return
+            }
+            self?.tapQueue.async {
+                guard let self, !self.isStopped else { return }
+                let backlog = self.micDiarizerBacklog.drain()
+                if !backlog.isEmpty { diarizer.append(backlog) }
+                self.micDiarizer = diarizer
+                self.logger.notice(
+                    "Meeting capture: mic diarizer attached \(Date().timeIntervalSince(self.startedAt), privacy: .public)s after start, replaying \(Double(backlog.count) / self.mixdownFormat.sampleRate, privacy: .public)s backlog"
+                )
+            }
         }
     }
 
@@ -206,24 +345,25 @@ final class MeetingAudioCapture: @unchecked Sendable {
     ///   releases everything pending regardless. Used when capture is about to stop (see
     ///   `VoiceInkEngine+Meeting.toggleMeetingCapture()`) and by `cutForManualSend()` - neither
     ///   has a guaranteed-soon "next chunk" to hand a held-back tail to.
-    func cut(forceFullRelease: Bool = false) -> MeetingCut {
-        let (mic, system, micNoiseFloor, systemNoiseFloor, deferredCount, systemDiarization) = tapQueue.sync {
-            () -> ([Int16], [Int16], Double, Double, Int, SystemDiarization?) in
+    func cut(forceFullRelease: Bool = false) async -> MeetingCut {
+        let (mic, system, micNoiseFloor, systemNoiseFloor, deferredCount, chunkStartGlobal, chunkEndGlobal) = tapQueue.sync {
+            () -> ([Int16], [Int16], Double, Double, Int, Int, Int) in
             self.drainTick()
 
+            let chunkStartGlobal = self.chunkPendingBaseOffset
             // Don't split an utterance that's still open (no closing silence yet) across this
             // cut and the next one - hold its tail back so it lands whole in the next chunk
-            // instead.
-            let boundary = MeetingAutoSendEvaluator.cutBoundary(
-                micVADState: self.micVADState, systemVADState: self.systemVADState,
-                chunkPendingBaseOffset: self.chunkPendingBaseOffset, forceFullRelease: forceFullRelease)
-
-            let chunkStartGlobal = self.chunkPendingBaseOffset
-            let released = self.drainBuffer.withLock { $0.releasePrefix(sampleCount: boundary) }
+            // instead. The pending audio is handed in so a length trigger that would otherwise
+            // defer everything (the open region spanning the whole buffer) cuts at its longest
+            // internal pause rather than delivering nothing - see `cutBoundary`.
+            let released = self.drainBuffer.withLock { buffer in
+                let boundary = MeetingAutoSendEvaluator.cutBoundary(
+                    micVADState: self.micVADState, systemVADState: self.systemVADState,
+                    chunkPendingBaseOffset: chunkStartGlobal, forceFullRelease: forceFullRelease,
+                    pendingAudio: buffer.chunkPending)
+                return buffer.releasePrefix(sampleCount: boundary)
+            }
             self.chunkPendingBaseOffset += released.mic.count
-
-            let systemDiarization = self.systemDiarizer?.attribute(
-                chunkStartGlobal: chunkStartGlobal, chunkEndGlobal: chunkStartGlobal + released.system.count)
 
             let noiseFloors = (self.chunkStartMicNoiseFloor, self.chunkStartSystemNoiseFloor)
             self.chunkStartMicNoiseFloor = self.micVADState.noiseFloor
@@ -234,12 +374,56 @@ final class MeetingAudioCapture: @unchecked Sendable {
             // "the manual hotkey ... resets the auto timer" behaviour.
             self.autoSendTracker.resetAfterChunkSent()
             self.isAutoSendPending = false
-            return (released.mic, released.system, noiseFloors.0, noiseFloors.1, released.deferredCount, systemDiarization)
+            return (
+                released.mic, released.system, noiseFloors.0, noiseFloors.1, released.deferredCount,
+                chunkStartGlobal, chunkStartGlobal + released.system.count
+            )
         }
+
+        // Give the streaming diarizer a bounded chance to catch up to this chunk's end before
+        // attributing it - off `tapQueue` so the periodic drain tick (which is what actually
+        // advances the diarizer, via `absorbAndWrite`) keeps running while this waits. A no-op
+        // (returns on its first check) when there is no diarizer this session.
+        await waitForDiarizerCommit(through: chunkEndGlobal)
+        let (systemDiarization, micDiarization) = tapQueue.sync {
+            (
+                self.systemDiarizer?.attribute(chunkStartGlobal: chunkStartGlobal, chunkEndGlobal: chunkEndGlobal),
+                self.micDiarizer?.attribute(chunkStartGlobal: chunkStartGlobal, chunkEndGlobal: chunkEndGlobal)
+            )
+        }
+        if systemDiarizer != nil || micDiarizer != nil {
+            let systemSpeakers = Set((systemDiarization?.regions ?? []).map(\.speaker))
+            let micSpeakers = Set((micDiarization?.regions ?? []).map(\.speaker))
+            logger.notice(
+                "Meeting chunk diarization: systemSegments=\(systemDiarization?.regions.count ?? 0, privacy: .public) systemSpeakers=\(systemSpeakers.count, privacy: .public) micSegments=\(micDiarization?.regions.count ?? 0, privacy: .public) micSpeakers=\(micSpeakers.count, privacy: .public)"
+            )
+        }
+
         return MeetingCut(
             mic: mic, system: system, mix: Self.mix(mic: mic, system: system),
             micNoiseFloor: micNoiseFloor, systemNoiseFloor: systemNoiseFloor, deferredSampleCount: deferredCount,
-            systemDiarization: systemDiarization)
+            systemDiarization: systemDiarization, micDiarization: micDiarization)
+    }
+
+    /// Polls (at `diarizationCommitPollIntervalSeconds`) for up to `diarizationCommitWaitSeconds`
+    /// until every diarizer running this session (`systemDiarizer` and/or `micDiarizer`) has
+    /// committed diarized probabilities through `chunkEndGlobal`, or has failed - so `cut()`'s
+    /// `attribute()` calls see the chunk fully covered whenever the diarizer's normal
+    /// streaming/offline latency (typically well under the bound) allows it, instead of relying on
+    /// `MeetingDiarizationAttributor`'s continuation fallback for a shortfall that would have
+    /// committed a moment later anyway.
+    private func waitForDiarizerCommit(through chunkEndGlobal: Int) async {
+        func isCaughtUp(_ diarizer: MeetingDiarizer?) -> Bool {
+            guard let diarizer else { return true }
+            return diarizer.failed || diarizer.committedThroughSample >= chunkEndGlobal
+        }
+
+        let deadline = Date().addingTimeInterval(Self.diarizationCommitWaitSeconds)
+        while true {
+            let done = tapQueue.sync { isCaughtUp(self.systemDiarizer) && isCaughtUp(self.micDiarizer) }
+            if done || Date() >= deadline { return }
+            try? await Task.sleep(nanoseconds: UInt64(Self.diarizationCommitPollIntervalSeconds * 1_000_000_000))
+        }
     }
 
     /// A manual (hotkey) chunk cut. Waits `manualCutDelaySeconds` first - long enough for a word
@@ -248,7 +432,7 @@ final class MeetingAudioCapture: @unchecked Sendable {
     /// much-delayed chunk the way an automatic cut's open-utterance deferral would (see `cut`).
     func cutForManualSend() async -> MeetingCut {
         try? await Task.sleep(nanoseconds: UInt64(Self.manualCutDelaySeconds * 1_000_000_000))
-        return cut(forceFullRelease: true)
+        return await cut(forceFullRelease: true)
     }
 
     // MARK: - Periodic draining
@@ -299,13 +483,41 @@ final class MeetingAudioCapture: @unchecked Sendable {
     private func absorbAndWrite(mic: [Int16], system: [Int16]) {
         let mic = MeetingDictationGate.silenceMicDuringDictation(mic, isDictationActive: isDictationActive)
         drainBuffer.withLock { $0.absorb(mic: mic, system: system) }
-        // Same `system` samples, same call order as `absorb` above, so the diarizer's internal
-        // absolute-sample position always matches `chunkPendingBaseOffset`'s coordinate frame.
-        systemDiarizer?.append(system)
+        // Same `mic`/`system` samples, same call order as `absorb` above, so each diarizer's
+        // internal absolute-sample position always matches `chunkPendingBaseOffset`'s coordinate
+        // frame - fed straight to the diarizer once attached, or into its backlog until then (see
+        // `MeetingDiarizerAttachBacklog`) so nothing absorbed before attach is lost from that
+        // coordinate frame.
+        if let systemDiarizer {
+            systemDiarizer.append(system)
+        } else {
+            systemDiarizerBacklog.absorb(system)
+        }
+        if let micDiarizer {
+            micDiarizer.append(mic)
+        } else {
+            micDiarizerBacklog.absorb(mic)
+        }
         do {
             try recordingWriter?.append(mic: mic, system: system)
         } catch {
             logger.error("Meeting capture: failed to append to the continuous recording file: \(error, privacy: .public)")
+        }
+
+        if var calibration = silenceCalibration {
+            if let floors = calibration.collector.absorb(mic: mic, system: system) {
+                micVADState.noiseFloor = floors.micFloor
+                micVADState.pinnedNoiseFloor = floors.micFloor
+                systemVADState.noiseFloor = floors.systemFloor
+                systemVADState.pinnedNoiseFloor = floors.systemFloor
+                silenceCalibration = nil
+                logger.notice(
+                    "Meeting capture: silence calibrated mic floor=\(Int(floors.micFloor), privacy: .public) system floor=\(Int(floors.systemFloor), privacy: .public)"
+                )
+                calibration.onCalibrated()
+            } else {
+                silenceCalibration = calibration
+            }
         }
 
         evaluateAutoSend(mic: mic, system: system)
@@ -439,6 +651,11 @@ final class MeetingAudioCapture: @unchecked Sendable {
                 try self.micRecorder.startRecording(toOutputFile: url, deviceID: deviceID)
             } catch {
                 self.logger.error("Meeting capture: microphone start failed \(error, privacy: .public)")
+                // ponytail: `micSetupQueue` racing `start()`'s own `captureStarted()` call means a
+                // failure landing first is a no-op here (nothing held yet) and gets re-acquired a
+                // moment later anyway - narrow window, self-corrects on the next `stop()`; revisit
+                // if a failed mic ever needs to keep the Mac from staying awake precisely.
+                self.keepAwakeLock.withLock { $0.captureEndedOrFailed() }
             }
         }
     }

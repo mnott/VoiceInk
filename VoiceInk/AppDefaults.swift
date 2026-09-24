@@ -46,6 +46,18 @@ enum PinnedDestinationSettingsKeys {
     /// `MeetingDiarizationModelManager`), so there is no silent download or behavior change for
     /// anyone who hasn't opted into that. Off falls back to the single generic "Others" label.
     static let identifyRemoteSpeakers = "MeetingCaptureIdentifyRemoteSpeakers"
+
+    /// Forces `MeetingCaptureModeDetector` to diarize the microphone instead of the system channel
+    /// even when a system tap is available - for an in-person meeting where some other app happens
+    /// to be playing audio. Off by default: without a system tap at all, in-person mode already
+    /// kicks in automatically (see `MeetingCaptureModeDetector`), so this is only needed for that
+    /// one edge case.
+    static let diarizeMicInPerson = "MeetingCaptureDiarizeMicInPerson"
+
+    /// Whether the one-time "mark a voice as 'This is me'" hint (shown the first time an in-person
+    /// meeting ends with no library voice flagged `isMe`) has already been shown - see
+    /// `VoiceInkEngine+Meeting`.
+    static let hasShownMissingMeVoiceHint = "MeetingCaptureHasShownMissingMeVoiceHint"
 }
 
 enum AppDefaults {
@@ -119,6 +131,7 @@ enum AppDefaults {
             PinnedDestinationSettingsKeys.pinnedITermTintColorHex: PinnedDestinationManager.hexString(
                 fromITermColor: PinnedDestinationManager.defaultPinnedBackgroundColor),
             PinnedDestinationSettingsKeys.identifyRemoteSpeakers: true,
+            PinnedDestinationSettingsKeys.diarizeMicInPerson: false,
 
             // UI & Behavior
             "IsMenuBarOnly": false,

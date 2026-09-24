@@ -54,6 +54,30 @@ struct MeetingTurnBuilderTests {
             ])
     }
 
+    /// The echo-leak regression (2026-09-24): a sustained, multi-second interjector - the shape of
+    /// uncancelled acoustic echo bleeding the host's own words back into the other channel, not a
+    /// brief "yeah"/"I agree" - must never split the host, even when a perfectly good nearby pause
+    /// exists (the same pause `anInterjectionWithANearbyInternalPauseSplitsTheHostAtThePause` would
+    /// split on for a short interjector). Splitting the host here would hand its second half to the
+    /// transcriber as a clip with no natural lead-in right where the interjector starts - exactly
+    /// where ASR reliably drops the opening word(s), the mechanism behind the host "losing" words
+    /// whenever a loud echo happens to land right where the host briefly pauses.
+    @Test func aLongInterjectorNeverSplitsTheHostEvenWithANearbyPause() {
+        // Others talks [0, 320000) with a 240 ms dip at [78400, 82240), right next to where Me's
+        // 10 s (160000-sample) interjection starts at 80000 - well over maxSplittableInterjectorSamples.
+        let othersSamples = loud(78400) + quiet(3840) + loud(320000 - 82240)
+        let turns = MeetingTurnBuilder.build(
+            meRegions: [Region(start: 80000, end: 240000)],
+            othersRegions: [Region(start: 0, end: 320000)],
+            meSamples: loud(240000), othersSamples: othersSamples
+        )
+        #expect(
+            turns == [
+                Turn(speaker: .others, start: 0, end: 320000),
+                Turn(speaker: .me, start: 80000, end: 240000),
+            ])
+    }
+
     @Test func consecutiveSameSpeakerTurnsWithASmallGapAreMerged() {
         let turns = MeetingTurnBuilder.build(
             meRegions: [Region(start: 0, end: 1000), Region(start: 1500, end: 2500)],
@@ -116,5 +140,53 @@ struct MeetingTurnBuilderTests {
 
     @Test func emptyInputProducesNoTurns() {
         #expect(MeetingTurnBuilder.build(meRegions: [], othersRegions: [], meSamples: [], othersSamples: []).isEmpty)
+    }
+
+    // MARK: - mergeAdjacentSameSpeakerForTranscription (the "sagen. können" fix)
+
+    /// The exact shape `cap()` produces for one long uninterrupted utterance: same-speaker turns
+    /// tiled back to back with zero gap. `MeetingTurnTranscriber` must send them to the ASR as one
+    /// clip, or the ASR closes each piece with its own sentence-ending punctuation mid-sentence.
+    @Test func capSplitPiecesOfTheSameSpeakerWithNoGapAreMergedForTranscription() {
+        let turns = [
+            Turn(speaker: .others, start: 0, end: 400_000),
+            Turn(speaker: .others, start: 400_000, end: 800_000),
+            Turn(speaker: .others, start: 800_000, end: 900_000),
+        ]
+        #expect(
+            MeetingTurnBuilder.mergeAdjacentSameSpeakerForTranscription(turns) == [
+                Turn(speaker: .others, start: 0, end: 900_000)
+            ])
+    }
+
+    @Test func sameSpeakerTurnsWithAGapUpToOnePointFiveSecondsAreMergedForTranscription() {
+        let gap = MeetingTurnBuilder.transcriptionMergeGapSamples
+        let turns = [
+            Turn(speaker: .others, start: 0, end: 100_000),
+            Turn(speaker: .others, start: 100_000 + gap, end: 200_000 + gap),
+        ]
+        #expect(
+            MeetingTurnBuilder.mergeAdjacentSameSpeakerForTranscription(turns) == [
+                Turn(speaker: .others, start: 0, end: 200_000 + gap)
+            ])
+    }
+
+    @Test func sameSpeakerTurnsWithAGapOverOnePointFiveSecondsAreNotMergedForTranscription() {
+        let gap = MeetingTurnBuilder.transcriptionMergeGapSamples + 1
+        let turns = [
+            Turn(speaker: .others, start: 0, end: 100_000),
+            Turn(speaker: .others, start: 100_000 + gap, end: 200_000 + gap),
+        ]
+        #expect(MeetingTurnBuilder.mergeAdjacentSameSpeakerForTranscription(turns) == turns)
+    }
+
+    /// A genuine speaker change must never be bridged into one clip, no matter how small the gap.
+    @Test func differentSpeakerNeighboursAreNeverMergedForTranscription() {
+        let turns = [
+            Turn(speaker: .others, start: 0, end: 100_000),
+            Turn(speaker: .me, start: 100_000, end: 200_000),
+            Turn(speaker: .others, start: 200_000, end: 300_000),
+        ]
+        #expect(MeetingTurnBuilder.mergeAdjacentSameSpeakerForTranscription(turns) == turns)
     }
 }

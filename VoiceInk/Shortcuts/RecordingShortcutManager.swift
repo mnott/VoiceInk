@@ -298,9 +298,13 @@ class RecordingShortcutManager: ObservableObject {
         case .pinDestination:
             await PinnedDestinationManager.shared.toggle()
         case .meetingCapture:
-            engine.toggleMeetingCapture()
+            await engine.toggleMeetingCapture()
         case .meetingChunk:
             await engine.sendMeetingChunk()
+        case .nameSpeaker:
+            NameSpeakerManager.shared.toggle(engine: engine)
+        case .calibrateMeetingSilence:
+            engine.calibrateMeetingSilence()
         default:
             break
         }

@@ -13,6 +13,18 @@ enum SpeakerLibraryService {
         rerenderMeetings(referencing: [id], library: library, modelContext: modelContext)
     }
 
+    /// What (if anything) a rename UI should persist once it reaches a commit point (Return
+    /// pressed, or focus lost) - `nil` when `draft` doesn't actually differ from what's already
+    /// stored. Exists so a rename field can gate `rename` (which re-renders every meeting that
+    /// references the voice) behind an explicit commit rather than firing it on every keystroke:
+    /// a field left focused after a previous rename used to stay armed to silently overwrite the
+    /// name with whatever stray text next reached it (e.g. dictation typed at the cursor
+    /// elsewhere), since each keystroke was persisted as soon as it landed. `nonisolated` so this
+    /// pure comparison is unit-testable without any view or store state.
+    nonisolated static func valueToPersist(draft: String, currentName: String?) -> String? {
+        draft == (currentName ?? "") ? nil : draft
+    }
+
     /// Merges `sourceID` into `targetID` and remaps every meeting record's turns accordingly.
     static func merge(sourceID: String, intoTargetID targetID: String, library: SpeakerLibraryStore, modelContext: ModelContext) {
         guard sourceID != targetID else { return }
@@ -77,7 +89,7 @@ enum SpeakerLibraryService {
 
     private static func meetingRecordings(modelContext: ModelContext) -> [Transcription] {
         let descriptor = FetchDescriptor<Transcription>(
-            predicate: #Predicate<Transcription> { $0.isMeetingRecording })
+            predicate: #Predicate<Transcription> { $0.isMeetingRecording && $0.deletedAt == nil })
         return (try? modelContext.fetch(descriptor)) ?? []
     }
 }

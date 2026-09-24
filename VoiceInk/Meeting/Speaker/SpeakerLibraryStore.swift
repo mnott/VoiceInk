@@ -49,10 +49,19 @@ final class SpeakerLibraryStore: ObservableObject {
 
     func name(for id: String) -> String? { voice(for: id)?.name }
 
-    /// Registers a brand-new voice from its first embedding, returning its freshly generated id.
+    /// Registers a brand-new voice from its first embedding, returning its id - `preferredID`
+    /// (when given and not already taken) is used as-is instead of generating a fresh one, so a
+    /// slot that already had a session id (from the live speaker tracker, or "Name Speaker") keeps
+    /// that same id once the library formally registers it - see `MeetingSpeakerIdentifier`.
     @discardableResult
-    func registerVoice(embedding: [Float], clipSamples: [Int16]?, meetingID: UUID) -> SpeakerVoice {
-        let id = SpeakerMatching.generateID(excluding: Set(voices.map(\.id)))
+    func registerVoice(embedding: [Float], clipSamples: [Int16]?, meetingID: UUID, preferredID: String? = nil) -> SpeakerVoice {
+        let existingIDs = Set(voices.map(\.id))
+        let id: String
+        if let preferredID, !existingIDs.contains(preferredID) {
+            id = preferredID
+        } else {
+            id = SpeakerMatching.generateID(excluding: existingIDs)
+        }
         let now = Date()
         var voice = SpeakerVoice(
             id: id, name: nil, embedding: embedding, embeddingCount: 1, sampleClipFileNames: [], firstHeard: now,
@@ -85,6 +94,19 @@ final class SpeakerLibraryStore: ObservableObject {
     func rename(id: String, to name: String?) {
         guard let index = voices.firstIndex(where: { $0.id == id }) else { return }
         voices[index].name = (name?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+        save()
+    }
+
+    /// Flags `id` as "this is me" - the mic speaker Meeting Capture's in-person mode renders as
+    /// "[Me:]" instead of a name/session id (see `MeetingMicSpeakerMapper`). Exclusive: there is
+    /// only one user, so flagging a voice clears the flag from every other one.
+    func setIsMe(id: String, isMe: Bool) {
+        guard let index = voices.firstIndex(where: { $0.id == id }) else { return }
+        if isMe {
+            for i in voices.indices { voices[i].isMe = voices[i].id == id }
+        } else {
+            voices[index].isMe = false
+        }
         save()
     }
 

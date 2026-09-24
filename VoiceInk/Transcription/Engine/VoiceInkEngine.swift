@@ -142,6 +142,38 @@ class VoiceInkEngine: NSObject, ObservableObject {
     @Published var isMeetingCaptureActive = false
     var meetingCapture: MeetingAudioCapture?
     var meetingChunkTask: Task<Void, Never>?
+    /// Identifies the in-progress session to the speaker library's `meetingIDs` bookkeeping (see
+    /// `MeetingLiveSpeakerTracker`) - set when capture starts, cleared when it stops. Distinct from
+    /// the `Transcription.id` the whole-meeting note eventually gets at stop time; both only ever
+    /// feed the same informational "which meetings mention this voice" list, so the mismatch has no
+    /// effect on matching/naming.
+    var currentMeetingID: UUID?
+    /// Set for the whole duration of `toggleMeetingCapture`'s stop branch (cleared via `defer`
+    /// once it returns) so a toggle pressed again mid-stop - e.g. while awaiting the final chunk's
+    /// task or `capture.cut()` - is ignored instead of starting a new session that would race the
+    /// old one's still-in-flight tracker reads/reset. Checked at the very top of
+    /// `toggleMeetingCapture`, before either branch.
+    var isMeetingCaptureStopping = false
+    /// The non-stop cut (auto or manual, see `sendMeetingChunkAutomatically`/`sendMeetingChunk`)
+    /// currently running, if any. Set synchronously (no await in between) by whichever triggers it
+    /// so `toggleMeetingCapture`'s stop branch can await it before cutting/stopping the same
+    /// `MeetingAudioCapture`: two concurrent `cut()`/`cutForManualSend()` calls on one capture race
+    /// each other's diarizer wait/attribute and delivery order, and `capture.stop()` tears the
+    /// diarizer down out from under a cut still using it - see `toggleMeetingCapture`'s stop branch.
+    /// Also chained auto-after-auto/manual-after-manual/either-after-the-other, so no two cuts on
+    /// the same capture ever run concurrently.
+    var pendingCutTask: Task<Void, Never>?
+    /// Live "who is speaking" state for the in-progress Meeting Capture session - see
+    /// `MeetingLiveSpeakerTracker`.
+    let liveSpeakerTracker = MeetingLiveSpeakerTracker()
+    /// Same tracker, same live-matching machinery, for mic-diarized speakers in an in-person
+    /// meeting (see `MeetingCaptureModeDetector`) - a separate instance because a mic-diarized
+    /// slot's arrival-ordered index is unrelated to a system-diarized one's, even though both
+    /// happen to start counting from 0.
+    let micSpeakerTracker = MeetingLiveSpeakerTracker()
+    /// "" while capture is idle or no turn has happened yet; otherwise "Me" or the current remote
+    /// speaker's session id/library name - kept in sync by `refreshCurrentMeetingSpeakerLabel`.
+    @Published private(set) var currentMeetingSpeakerLabel: String = ""
     /// Holds/merges a meeting chunk's delivery while the user is typing into the destination -
     /// see `VoiceInkEngine+Meeting.deliverMeetingChunkText` and `MeetingChunkDeliveryGuard`.
     lazy var meetingChunkDeliveryCoordinator = MeetingChunkDeliveryCoordinator<MeetingChunkPayload>(
@@ -198,6 +230,33 @@ class VoiceInkEngine: NSObject, ObservableObject {
 
         setupNotifications()
         createRecordingsDirectoryIfNeeded()
+        liveSpeakerTracker.onStateChange = { [weak self] in self?.refreshCurrentMeetingSpeakerLabel() }
+        micSpeakerTracker.onStateChange = { [weak self] in self?.refreshCurrentMeetingSpeakerLabel() }
+    }
+
+    /// Mirrors whichever tracker is active this session's current speaker into a plain `@Published`
+    /// property so views (e.g. the menu bar's "who's speaking" row) only need to observe `engine`,
+    /// the same as every other recording-state surface - see `MeetingLiveSpeakerTracker
+    /// .onStateChange`. The two trackers are mutually exclusive in practice (`captureMode` decides
+    /// which channel is diarized), so whichever one has recorded a turn this session is the one
+    /// showing; `micSpeakerTracker` additionally needs the "This is me" library check
+    /// (`MeetingMicSpeakerMapper`) since its turns are never recorded as `.me` directly (see
+    /// `MeetingTurnBuilder.Speaker.otherMic`'s doc comment).
+    private func refreshCurrentMeetingSpeakerLabel() {
+        guard isMeetingCaptureActive else {
+            currentMeetingSpeakerLabel = ""
+            return
+        }
+        if let speaker = liveSpeakerTracker.state.currentSpeaker {
+            currentMeetingSpeakerLabel = liveSpeakerTracker.state.label(for: speaker)
+        } else if let slot = micSpeakerTracker.state.mostRecentRemoteSlot, micSpeakerTracker.state.currentSpeaker != nil {
+            currentMeetingSpeakerLabel = MeetingMicSpeakerMapper.label(
+                libraryID: micSpeakerTracker.state.libraryID(forSlot: slot),
+                isMeVoice: { SpeakerLibraryStore.shared.voice(for: $0)?.isMe == true },
+                fallback: micSpeakerTracker.state.label(for: .remote(slot: slot)))
+        } else {
+            currentMeetingSpeakerLabel = ""
+        }
     }
 
     private func createRecordingsDirectoryIfNeeded() {

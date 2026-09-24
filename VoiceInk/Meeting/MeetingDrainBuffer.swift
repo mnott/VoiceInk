@@ -55,6 +55,12 @@ struct MeetingDrainBuffer {
         return (mic, system)
     }
 
+    /// Read-only peek at what's queued for the next cut - `MeetingAutoSendEvaluator.cutBoundary`'s
+    /// starvation fallback scans it for a shared internal pause. Mic and system are always
+    /// equal-length here: every writer (`absorb`, and `releasePrefix`/`cutChunkPending` on the way
+    /// out) appends both in lockstep.
+    var chunkPending: (mic: [Int16], system: [Int16]) { (chunkPendingMic, chunkPendingSystem) }
+
     /// Releases only the first `sampleCount` samples of what's queued (clamped to what's actually
     /// pending), retaining the rest for the next cut instead of clearing it. Used by
     /// `MeetingAudioCapture.cut()` to hold back the tail of an utterance that's still open at the

@@ -13,8 +13,48 @@ struct SpeakerVoice: Codable, Identifiable, Equatable {
     var firstHeard: Date
     var lastHeard: Date
     var meetingIDs: [UUID]
+    /// Whether this voice is flagged as the user's own - set once, from Settings -> Speakers or
+    /// Identify Speakers ("This is me"), so Meeting Capture's in-person mode can tell which
+    /// diarized mic speaker is the user instead of guessing from who talks most (see
+    /// `MeetingMicSpeakerMapper`). At most one voice is ever flagged - see
+    /// `SpeakerLibraryStore.setIsMe`.
+    var isMe: Bool
 
     var meetingsCount: Int { meetingIDs.count }
+
+    init(
+        id: String, name: String?, embedding: [Float], embeddingCount: Int, sampleClipFileNames: [String],
+        firstHeard: Date, lastHeard: Date, meetingIDs: [UUID], isMe: Bool = false
+    ) {
+        self.id = id
+        self.name = name
+        self.embedding = embedding
+        self.embeddingCount = embeddingCount
+        self.sampleClipFileNames = sampleClipFileNames
+        self.firstHeard = firstHeard
+        self.lastHeard = lastHeard
+        self.meetingIDs = meetingIDs
+        self.isMe = isMe
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, embedding, embeddingCount, sampleClipFileNames, firstHeard, lastHeard, meetingIDs, isMe
+    }
+
+    /// Custom decoding only to default `isMe` to `false` for a library saved before this flag
+    /// existed - synthesized `Decodable` would otherwise fail on the missing key.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        name = try container.decodeIfPresent(String.self, forKey: .name)
+        embedding = try container.decode([Float].self, forKey: .embedding)
+        embeddingCount = try container.decode(Int.self, forKey: .embeddingCount)
+        sampleClipFileNames = try container.decode([String].self, forKey: .sampleClipFileNames)
+        firstHeard = try container.decode(Date.self, forKey: .firstHeard)
+        lastHeard = try container.decode(Date.self, forKey: .lastHeard)
+        meetingIDs = try container.decode([UUID].self, forKey: .meetingIDs)
+        isMe = try container.decodeIfPresent(Bool.self, forKey: .isMe) ?? false
+    }
 }
 
 /// Pure (no file I/O) matching/merge/id-generation logic - the part of the speaker library that is
@@ -101,7 +141,8 @@ enum SpeakerMatching {
             sampleClipFileNames: Array((target.sampleClipFileNames + source.sampleClipFileNames).prefix(3)),
             firstHeard: min(target.firstHeard, source.firstHeard),
             lastHeard: max(target.lastHeard, source.lastHeard),
-            meetingIDs: Array(Set(target.meetingIDs + source.meetingIDs))
+            meetingIDs: Array(Set(target.meetingIDs + source.meetingIDs)),
+            isMe: target.isMe || source.isMe
         )
     }
 }

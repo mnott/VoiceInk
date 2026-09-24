@@ -77,6 +77,31 @@ struct SpeakerIDGenerationTests {
     }
 }
 
+// MARK: - Rename commit gating
+
+// Regression coverage for a live bug: a rename `TextField` bound to fire on every keystroke left
+// a voice's name armed to be silently overwritten by whatever stray text (e.g. dictation typed at
+// the cursor while the field kept focus after a previous Return) reached it next - "Guest" became
+// "I" between two Meeting Capture sessions with no deliberate rename in between. The fix gates
+// persistence behind an explicit commit point (Return / focus loss) and this pure comparison.
+struct SpeakerRenameCommitGatingTests {
+    @Test func unchangedDraftPersistsNothing() {
+        #expect(SpeakerLibraryService.valueToPersist(draft: "Guest", currentName: "Guest") == nil)
+    }
+
+    @Test func draftMatchingNoPriorNamePersistsNothing() {
+        #expect(SpeakerLibraryService.valueToPersist(draft: "", currentName: nil) == nil)
+    }
+
+    @Test func changedDraftPersistsTheNewValue() {
+        #expect(SpeakerLibraryService.valueToPersist(draft: "Alice", currentName: "Guest") == "Alice")
+    }
+
+    @Test func firstNamePersistsFromNoPriorName() {
+        #expect(SpeakerLibraryService.valueToPersist(draft: "Alice", currentName: nil) == "Alice")
+    }
+}
+
 // MARK: - Matching / merging (pure, synthetic embeddings)
 
 struct SpeakerMatchingTests {
@@ -148,6 +173,81 @@ struct SpeakerMatchingTests {
 
         #expect(SpeakerMatching.merge(source: unnamed, into: named).name == "Anna")
         #expect(SpeakerMatching.merge(source: named, into: unnamed).name == "Anna")
+    }
+
+    @Test func mergeKeepsTheIsMeFlagIfEitherSideHadIt() {
+        var isMeVoice = voice(id: "spk-a", embedding: [1, 0])
+        isMeVoice.isMe = true
+        let plainVoice = voice(id: "spk-b", embedding: [0, 1])
+
+        #expect(SpeakerMatching.merge(source: isMeVoice, into: plainVoice).isMe)
+        #expect(SpeakerMatching.merge(source: plainVoice, into: isMeVoice).isMe)
+    }
+
+    @Test func voiceCreatedBeforeTheIsMeFieldExistedDecodesAsFalse() throws {
+        // Mirrors a `speakers.json` written before `isMe` existed - the key is simply absent.
+        let legacyJSON = """
+            {
+                "id": "spk-a", "embedding": [1, 0], "embeddingCount": 1, "sampleClipFileNames": [],
+                "firstHeard": 0, "lastHeard": 0, "meetingIDs": []
+            }
+            """
+        let decoded = try JSONDecoder().decode(SpeakerVoice.self, from: Data(legacyJSON.utf8))
+        #expect(!decoded.isMe)
+    }
+}
+
+// MARK: - Resolving a diarized slot's id (pure decision rule behind `assignSpeakers`)
+
+struct ResolvedSpeakerIDTests {
+    @Test func libraryMatchOverridesTheSessionIDWhenEmbeddingIsPresent() {
+        let id = MeetingSpeakerIdentifier.resolvedSpeakerID(
+            libraryMatchID: "spk-library", sessionID: "spk-session", freshID: "spk-fresh")
+        #expect(id == "spk-library")
+    }
+
+    @Test func sessionIDIsReusedWhenThereIsNoLibraryMatch() {
+        let id = MeetingSpeakerIdentifier.resolvedSpeakerID(libraryMatchID: nil, sessionID: "spk-session", freshID: "spk-fresh")
+        #expect(id == "spk-session")
+    }
+
+    @Test func aFreshIDIsGeneratedOnlyWhenNeitherALibraryMatchNorASessionIDExists() {
+        let id = MeetingSpeakerIdentifier.resolvedSpeakerID(libraryMatchID: nil, sessionID: nil, freshID: "spk-fresh")
+        #expect(id == "spk-fresh")
+    }
+}
+
+// MARK: - assignSpeakers never collapses a diarized slot to "Others", even without an embedder
+
+@MainActor
+struct MeetingSpeakerIdentifierAssignmentTests {
+    private func turn(diarizedSlot: Int, start: Int) -> MeetingTurnRecord {
+        MeetingTurnRecord(isMe: false, diarizedSlot: diarizedSlot, speakerID: nil, start: start, end: start + 32_000, text: "hello")
+    }
+    private let systemChannel = [Int16](repeating: 100, count: 400_000)
+
+    @Test func distinctDiarizedSlotsGetDistinctIDsWhenTheEmbedderReturnsNil() async {
+        // Reproduces the bug: no speaker-embedding model downloaded -> `embed` always returns nil.
+        // Every diarized slot must still end up with its own stable id, never a shared/nil one.
+        let turns = [turn(diarizedSlot: 0, start: 0), turn(diarizedSlot: 1, start: 100_000), turn(diarizedSlot: 2, start: 200_000)]
+        let result = await MeetingSpeakerIdentifier.assignSpeakers(
+            to: turns, systemChannel: systemChannel, meetingID: UUID(), library: SpeakerLibraryStore.shared, embed: { _ in nil })
+
+        let ids = result.map(\.speakerID)
+        #expect(ids.allSatisfy { $0 != nil })
+        #expect(Set(ids).count == 3)
+    }
+
+    @Test func liveSessionIDsAreReusedWhenTheEmbedderReturnsNil() async {
+        // The note must show the same ids the live chunks of this session already showed for these
+        // slots, not freshly generated ones.
+        let turns = [turn(diarizedSlot: 0, start: 0), turn(diarizedSlot: 1, start: 100_000)]
+        let result = await MeetingSpeakerIdentifier.assignSpeakers(
+            to: turns, systemChannel: systemChannel, meetingID: UUID(), library: SpeakerLibraryStore.shared,
+            sessionIDBySlot: [0: "spk-0000", 1: "spk-0001"], embed: { _ in nil })
+
+        #expect(result.first { $0.diarizedSlot == 0 }?.speakerID == "spk-0000")
+        #expect(result.first { $0.diarizedSlot == 1 }?.speakerID == "spk-0001")
     }
 }
 

@@ -12,6 +12,8 @@ enum ShortcutAction: Hashable {
     case pinDestination
     case meetingCapture
     case meetingChunk
+    case nameSpeaker
+    case calibrateMeetingSilence
     case mode(UUID)
     case recorderPanelEscape
     case recorderPanelMode(Int)
@@ -53,6 +55,10 @@ enum ShortcutAction: Hashable {
             return "meetingCapture"
         case .meetingChunk:
             return "meetingChunk"
+        case .nameSpeaker:
+            return "nameSpeaker"
+        case .calibrateMeetingSilence:
+            return "calibrateMeetingSilence"
         case .mode(let id):
             return "mode_\(id.uuidString)"
         case .recorderPanelEscape:
@@ -86,6 +92,10 @@ enum ShortcutAction: Hashable {
             return String(localized: "Toggle Meeting Capture")
         case .meetingChunk:
             return String(localized: "Send Meeting Chunk")
+        case .nameSpeaker:
+            return String(localized: "Name Speaker")
+        case .calibrateMeetingSilence:
+            return String(localized: "Calibrate Silence")
         case .mode(let id):
             if let config = ModeManager.shared.getConfiguration(with: id) {
                 return String(format: String(localized: "%@ Mode"), config.name)
@@ -112,6 +122,8 @@ enum ShortcutAction: Hashable {
         .pinDestination,
         .meetingCapture,
         .meetingChunk,
+        .nameSpeaker,
+        .calibrateMeetingSilence,
     ]
 
     static let recorderPanelStoredActions: [Self] = [

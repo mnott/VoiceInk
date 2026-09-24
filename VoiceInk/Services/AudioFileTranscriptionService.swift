@@ -98,9 +98,10 @@ class AudioTranscriptionService: ObservableObject {
 
         if hasSpeech {
             let library = SpeakerLibraryStore.shared
-            let systemChannel = (try? MeetingRecordingWriter.readChannels(from: url))?.system ?? []
+            let channels = (try? MeetingRecordingWriter.readChannels(from: url)) ?? (mic: [], system: [])
             turns = await MeetingSpeakerIdentifier.assignSpeakers(
-                to: turns, systemChannel: systemChannel, meetingID: newTranscription.id, library: library)
+                to: turns, systemChannel: channels.system, micChannel: channels.mic,
+                meetingID: newTranscription.id, library: library)
             newTranscription.meetingTurns = turns
             newTranscription.text = MeetingSpeakerTranscriptRenderer.render(turns) { library.name(for: $0) }
         }

@@ -40,6 +40,40 @@ struct MeetingAudioCaptureMixTests {
     }
 }
 
+// MARK: - Meeting Capture: "This Is Silence" calibration window
+
+struct MeetingSilenceCalibrationCollectorTests {
+    private static func tone(_ seconds: Double, amplitude: Int16) -> [Int16] {
+        let count = Int(seconds * MeetingVAD.sampleRate)
+        return (0..<count).map {
+            Int16(clamping: Int(Double(amplitude) * sin(2 * Double.pi * 400 * Double($0) / MeetingVAD.sampleRate)))
+        }
+    }
+
+    @Test func collectorStaysNilUntilTheFullTwoSecondWindowHasArrived() {
+        var collector = MeetingAudioCapture.SilenceCalibrationCollector()
+        let tick = Self.tone(0.5, amplitude: 500)
+
+        for _ in 0..<3 {
+            #expect(collector.absorb(mic: tick, system: tick) == nil, "nothing until the full 2s window is collected")
+        }
+
+        let floors = collector.absorb(mic: tick, system: tick)
+        let expected = MeetingVAD.calibrationLevel(Self.tone(2.0, amplitude: 500))
+        #expect(floors?.micFloor == expected, "the floor is the measured window's own level")
+        #expect(floors?.systemFloor == expected)
+    }
+
+    @Test func collectorIgnoresAudioAfterTheWindowIsFull() {
+        var collector = MeetingAudioCapture.SilenceCalibrationCollector()
+        let tick = Self.tone(0.5, amplitude: 500)
+        for _ in 0..<4 { _ = collector.absorb(mic: tick, system: tick) }
+
+        let loud = Self.tone(0.5, amplitude: 8000)
+        #expect(collector.absorb(mic: loud, system: loud) == nil, "a completed window is done - late audio is ignored")
+    }
+}
+
 // MARK: - Meeting Capture: WAV header
 
 struct MeetingAudioCaptureWAVTests {
@@ -416,6 +450,59 @@ struct MeetingDrainBufferTests {
         buffer.appendMic([2, 3])
         let (mic, _) = buffer.drainRaw()
         #expect(mic == [2, 3])
+    }
+}
+
+// MARK: - Meeting Capture: buffering samples absorbed before a diarizer attaches
+
+struct MeetingDiarizerAttachBacklogTests {
+    @Test func samplesAbsorbedBeforeAttachAreDrainedFirstAndInOrder() {
+        var backlog = MeetingDiarizerAttachBacklog()
+        backlog.startCollecting()
+        backlog.absorb([1, 2, 3])
+        backlog.absorb([4, 5])
+
+        #expect(backlog.drain() == [1, 2, 3, 4, 5])
+    }
+
+    @Test func nothingIsCollectedBeforeStartCollecting() {
+        var backlog = MeetingDiarizerAttachBacklog()
+        backlog.absorb([1, 2, 3])
+        #expect(backlog.drain().isEmpty)
+    }
+
+    @Test func drainReturnsEachSampleExactlyOnceThenStopsCollecting() {
+        var backlog = MeetingDiarizerAttachBacklog()
+        backlog.startCollecting()
+        backlog.absorb([1, 2, 3])
+
+        #expect(backlog.drain() == [1, 2, 3])
+        // Draining stops collection - anything absorbed afterwards (the diarizer is attached and
+        // receiving live samples directly by now) must not reappear in a later drain.
+        backlog.absorb([4, 5])
+        #expect(backlog.drain().isEmpty)
+    }
+
+    @Test func discardClearsWhateverWasBufferedAndStopsCollecting() {
+        var backlog = MeetingDiarizerAttachBacklog()
+        backlog.startCollecting()
+        backlog.absorb([1, 2, 3])
+
+        backlog.discard()
+        #expect(!backlog.isCollecting)
+
+        backlog.absorb([4, 5])
+        #expect(backlog.drain().isEmpty)
+    }
+
+    @Test func absorbAcrossManySmallCallsStillDrainsInTheSameOrderTheyWereAbsorbed() {
+        // Mirrors real drain ticks: several small, separately-absorbed chunks (not one big array).
+        var backlog = MeetingDiarizerAttachBacklog()
+        backlog.startCollecting()
+        let chunks: [[Int16]] = [[1, 2], [3], [4, 5, 6], [], [7]]
+        for chunk in chunks { backlog.absorb(chunk) }
+
+        #expect(backlog.drain() == chunks.flatMap { $0 })
     }
 }
 

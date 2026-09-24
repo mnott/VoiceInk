@@ -49,7 +49,8 @@ struct MeetingAutoSendEvaluatorTests {
                 triggerSilenceDurations.append(tracker.currentSilenceDuration)
                 let boundary = MeetingAutoSendEvaluator.cutBoundary(
                     micVADState: micState, systemVADState: systemState,
-                    chunkPendingBaseOffset: chunkPendingBaseOffset, forceFullRelease: false)
+                    chunkPendingBaseOffset: chunkPendingBaseOffset, forceFullRelease: false,
+                    pendingAudio: (Array(mic[chunkPendingBaseOffset..<end]), Array(system[chunkPendingBaseOffset..<end])))
                 let pendingLength = end - chunkPendingBaseOffset
                 let delivered = boundary == .max ? pendingLength : min(boundary, pendingLength)
                 chunkPendingBaseOffset += delivered
@@ -138,5 +139,64 @@ struct MeetingAutoSendEvaluatorTests {
             result.tracker.speechSecondsSinceLastChunk >= 9.5,
             "the whole span must count as speech, not just the ~25% of voiced frames (got \(result.tracker.speechSecondsSinceLastChunk)s)"
         )
+    }
+
+    @Test func aLengthTriggerWithTheOpenRegionSpanningTheWholePendingBufferCutsAtTheLongestInternalPause() {
+        // Reproduces the live 10:21 bug: 60s of uninterrupted speech kept the VAD region open from
+        // the chunk start ("delivered=0 deferred=960320"), so nothing was ever sent until a manual
+        // send or stop, with the pending buffer growing without bound. Instead of deferring
+        // everything, the cut must land at the longest pause both channels share inside the open
+        // region (nobody talking on either side) - the same "split at the longest internal pause"
+        // idea as `MeetingTurnBuilder.cap`.
+        let sr = Int(Self.sampleRate)
+        let pauseStart = 30 * sr
+        let pauseEnd = 31 * sr
+        let system = Self.speechBurst(seconds: 30)
+            + [Int16](repeating: 0, count: pauseEnd - pauseStart)
+            + Self.speechBurst(seconds: 30)
+        let mic = [Int16](repeating: 0, count: system.count)
+        var openState = MeetingVAD.State.initial
+        openState.inSpeech = true
+        openState.speechStart = 0  // the open region spans the whole pending buffer
+
+        let boundary = MeetingAutoSendEvaluator.cutBoundary(
+            micVADState: openState, systemVADState: .initial, chunkPendingBaseOffset: 0,
+            forceFullRelease: false, pendingAudio: (mic, system))
+
+        #expect(boundary > 0, "a length trigger must never release nothing")
+        #expect(boundary == (pauseStart + pauseEnd) / 2, "must cut at the midpoint of the longest shared pause, got \(boundary)")
+    }
+
+    @Test func aLengthTriggerWithNoInternalPauseAnywhereCutsAtThePendingEndInsteadOfDeliveringNothing() {
+        // Continuous speech with genuinely no pause at all: no better cut point exists, so the
+        // pending end (a hard cut) is the least-bad boundary - still never nothing.
+        let system = Self.speechBurst(seconds: 61)
+        let mic = [Int16](repeating: 0, count: system.count)
+        var openState = MeetingVAD.State.initial
+        openState.inSpeech = true
+        openState.speechStart = 0
+
+        let boundary = MeetingAutoSendEvaluator.cutBoundary(
+            micVADState: openState, systemVADState: .initial, chunkPendingBaseOffset: 0,
+            forceFullRelease: false, pendingAudio: (mic, system))
+
+        #expect(boundary == system.count, "no pause to split at - deliver everything rather than nothing")
+    }
+
+    @Test func aNormalOpenUtteranceTailIsStillDeferredWhenRealClosedSpeechSitsAheadOfIt() {
+        // The normal deferral case must stay exactly as it was: 30s of closed speech ahead of a
+        // still-open tail is a real chunk on its own - the starvation fallback must not engage.
+        let sr = Int(Self.sampleRate)
+        let system = Self.speechBurst(seconds: 30) + Self.speechBurst(seconds: 30)
+        let mic = [Int16](repeating: 0, count: system.count)
+        var openState = MeetingVAD.State.initial
+        openState.inSpeech = true
+        openState.speechStart = 30 * sr  // the open tail starts where the closed speech ended
+
+        let boundary = MeetingAutoSendEvaluator.cutBoundary(
+            micVADState: openState, systemVADState: .initial, chunkPendingBaseOffset: 0,
+            forceFullRelease: false, pendingAudio: (mic, system))
+
+        #expect(boundary == 30 * sr, "the open tail must still be held back whole for the next chunk")
     }
 }

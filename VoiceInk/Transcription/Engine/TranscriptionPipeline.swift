@@ -44,10 +44,13 @@ class TranscriptionPipeline {
     ///   - audioURL: The recorded audio file.
     ///   - transcriptionConfiguration: Mode-resolved transcription engine settings for this phase.
     ///   - session: An active streaming session if one was prepared, otherwise nil.
-    ///   - pretranscribedText: When set, skips transcribing `audioURL` and runs the rest of the
-    ///     pipeline (filter, format, word replacement, enhancement, delivery, History save) on
-    ///     this text instead - used by meeting capture, which transcribes its mic and system
-    ///     tracks separately and hands in their already-combined text.
+    ///   - pretranscribedText: When set, skips transcribing `audioURL` (and the hallucination
+    ///     filter that only makes sense on raw model output) and runs the rest of the pipeline
+    ///     (format, word replacement, enhancement, delivery, History save) on this text instead -
+    ///     used by meeting capture, which transcribes its mic and system tracks separately and
+    ///     hands in their already-filtered, speaker-labelled ("[Me:] ...") combined text; running
+    ///     the hallucination filter's `\[.*?\]` bracket-stripping on it here would silently erase
+    ///     every speaker label.
     ///   - saveToHistory: When false, `transcription` is filtered/formatted/enhanced/delivered
     ///     exactly as usual but never saved or posted as a History event - used by meeting-chunk
     ///     deliveries, which are paste-only; the meeting's one History record is created
@@ -125,7 +128,7 @@ class TranscriptionPipeline {
                     context: transcriptionConfiguration.requestContext
                 )
             }
-            text = TranscriptionOutputFilter.filter(text)
+            text = Self.postTranscriptionText(pretranscribedText: pretranscribedText, transcribedText: text)
             let transcriptionDuration = Date().timeIntervalSince(transcriptionStart)
 
             if shouldCancel() {
@@ -307,6 +310,15 @@ class TranscriptionPipeline {
         )
 
         saveTranscriptionAndPostCompletion()
+    }
+
+    /// Raw model output gets the Whisper hallucination filter (strips junk like `[BLANK_AUDIO]`
+    /// via its bracket-stripping `\[.*?\]` pattern); `pretranscribedText` must not, since meeting
+    /// capture's already-filtered, speaker-labelled text ("[Me:] ...", "[spk-0001:] ..." - see
+    /// `MeetingTurnTranscriptRenderer`) would have every one of those labels erased by that same
+    /// bracket-stripping otherwise.
+    static func postTranscriptionText(pretranscribedText: String?, transcribedText: String) -> String {
+        pretranscribedText == nil ? TranscriptionOutputFilter.filter(transcribedText) : transcribedText
     }
 
     private func metadata(for mode: ModeConfig?) -> (name: String?, emoji: String?) {
