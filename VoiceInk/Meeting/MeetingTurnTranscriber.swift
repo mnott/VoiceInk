@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Runs VAD + turn building on a self-contained stereo buffer (a chunk-hotkey cut, or one
 /// silence-bounded super-block of a longer recording) and transcribes each turn serially from
@@ -8,6 +9,7 @@ import Foundation
 /// both get the same speaker-ordering and echo-safety treatment instead of one being windowed and
 /// the other not.
 enum MeetingTurnTranscriber {
+    private static let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "MeetingTurnTranscriber")
     /// - Parameters:
     ///   - micNoiseFloor: Seeds the mic channel's VAD noise floor instead of starting from 0 - see
     ///     `MeetingVAD.regions(for:startingNoiseFloor:)`. Defaults to 0 (the previous behaviour)
@@ -61,7 +63,8 @@ enum MeetingTurnTranscriber {
             let clip = MeetingAudioCapture.padded(
                 Array(source[turn.start..<turn.end]), paddingSamples: MeetingTurnBuilder.transcriptionPaddingSamples)
             let text = await transcribedText(
-                for: clip, model: model, requestContext: requestContext, serviceRegistry: serviceRegistry)
+                for: clip, span: turn.start..<turn.end, model: model, requestContext: requestContext,
+                serviceRegistry: serviceRegistry)
             let filtered = TranscriptionOutputFilter.filter(text).trimmingCharacters(in: .whitespacesAndNewlines)
             // Drops punctuation-only interjections ("-", "...") that VAD/diarization still turn
             // into a labelled turn but that carry no actual words.
@@ -89,8 +92,12 @@ enum MeetingTurnTranscriber {
         return (regions, speakers, floor)
     }
 
+    /// Transcribes one turn's clip. A failed transcription is logged (with the turn's span and the
+    /// error) and returns "" - the turn is dropped by the caller exactly as before, but the drop is
+    /// no longer invisible, which is how a whole meeting could come out as an empty note. A
+    /// successful but wordless result (model heard nothing it recognised) logs one `.notice` line.
     private static func transcribedText(
-        for samples: [Int16],
+        for samples: [Int16], span: Range<Int>,
         model: any TranscriptionModel, requestContext: TranscriptionRequestContext,
         serviceRegistry: TranscriptionServiceRegistry
     ) async -> String {
@@ -99,8 +106,16 @@ enum MeetingTurnTranscriber {
 
         do {
             try MeetingAudioCapture.writeWAV(samples, to: trackURL)
-            return try await serviceRegistry.transcribe(audioURL: trackURL, model: model, context: requestContext)
+            let text = try await serviceRegistry.transcribe(audioURL: trackURL, model: model, context: requestContext)
+            if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                logger.notice(
+                    "Transcription returned no text for turn samples \(span.lowerBound, privacy: .public)-\(span.upperBound, privacy: .public)")
+            }
+            return text
         } catch {
+            logger.error(
+                "Transcription failed for turn samples \(span.lowerBound, privacy: .public)-\(span.upperBound, privacy: .public): \(error.localizedDescription, privacy: .public)"
+            )
             return ""
         }
     }

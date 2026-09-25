@@ -1,22 +1,7 @@
-<?xml version="1.0" standalone="yes"?>
-<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
-    <channel>
-        <title>VoiceInk</title>
-        <item>
-            <title>2.2.1</title>
-            <pubDate>Fri, 25 Sep 2026 10:27:22 +0200</pubDate>
-            <sparkle:version>212</sparkle:version>
-            <sparkle:shortVersionString>2.2.1</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.4</sparkle:minimumSystemVersion>
-            <description><![CDATA[<h3>What's New in VoiceInk 2.2.1</h3>
+<h3>What's New in VoiceInk 2.2.1</h3>
 <p>Fixes for imported meeting recordings: correct audio decoding, visible errors, and your language choice respected.</p>
 <ul>
   <li>🎙️ <strong>Meeting WAVs from other apps decode correctly</strong> — Recordings converted with ffmpeg or written by other tools carry extra RIFF chunks before the audio data; VoiceInk assumed a fixed 44-byte header, which shifted and swapped the channels. The header is now parsed properly, so an imported meeting file transcribes with mic and system channels intact.</li>
   <li>🔍 <strong>Transcription failures are no longer silent</strong> — If a turn's transcription fails (e.g. the model is missing), the error is logged instead of being swallowed as empty text. An imported file that produces an empty transcript now tells you why.</li>
   <li>🇩🇪 <strong>Meeting re-transcription honours your language setting</strong> — Re-transcribing a meeting file used the raw language default (autodetect) instead of the language selected in your active mode, so short noisy passages could come out in the wrong language. The meeting path now uses exactly the same validated language as dictation.</li>
 </ul>
-]]></description>
-            <enclosure url="https://github.com/mnott/VoiceInk/releases/download/v2.2.1/VoiceInk.dmg" length="33197414" type="application/octet-stream" sparkle:edSignature="mhbI5EablaVOigFBMhohYQbSj6kPO10yZEQmuA1F8xLJu0lERFucET2EF24XLQWJ0Bqq9keXXvGZYReVMAdiAA=="/>
-        </item>
-    </channel>
-</rss>

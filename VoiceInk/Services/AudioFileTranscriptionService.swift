@@ -43,6 +43,26 @@ class AudioTranscriptionService: ObservableObject {
         self.serviceRegistry = serviceRegistry
     }
 
+    /// The language/prompt context both re-transcription paths share, built from the same source
+    /// dictation uses (`ModeRuntimeResolver.transcriptionConfiguration`): the active mode's
+    /// `selectedLanguage`, validated for the model. The meeting path used to read
+    /// `TranscriptionRequestContext.currentDefaults` instead - the raw `UserDefaults
+    /// "SelectedLanguage"` string with an `"auto"` fallback - so a fixed-language meeting
+    /// re-transcribed with autodetect, its short noisy head coming out in random languages.
+    static func retranscriptionRequestContext(for model: any TranscriptionModel, mode: ModeConfig?)
+        -> TranscriptionRequestContext
+    {
+        let language = TranscriptionLanguageSupport.validLanguageOrFallback(
+            mode?.selectedLanguage,
+            for: model,
+            realtimeEnabled: mode?.isRealtimeTranscriptionEnabled
+        )
+        return TranscriptionRequestContext(
+            language: language,
+            prompt: model.provider == .whisper ? UserDefaults.standard.string(forKey: "TranscriptionPrompt") : nil
+        )
+    }
+
     /// Re-transcribes a meeting's continuous stereo recording using the same two-channel,
     /// speaker-labelled treatment as when the meeting's History record was first created
     /// (`MeetingRecordingTranscriber`), instead of downmixing it like a normal recording. AI
@@ -57,7 +77,8 @@ class AudioTranscriptionService: ObservableObject {
 
         await MainActor.run { isTranscribing = true }
 
-        let requestContext = TranscriptionRequestContext.currentDefaults.scoped(to: model)
+        let requestContext = Self.retranscriptionRequestContext(
+            for: model, mode: ModeManager.shared.currentEffectiveConfiguration)
         var turns = await MeetingRecordingTranscriber.transcribe(
             stereoURL: url,
             model: model,
@@ -132,15 +153,7 @@ class AudioTranscriptionService: ObservableObject {
 
         do {
             let mode = mode ?? ModeManager.shared.currentEffectiveConfiguration
-            let language = TranscriptionLanguageSupport.validLanguageOrFallback(
-                mode?.selectedLanguage,
-                for: model,
-                realtimeEnabled: mode?.isRealtimeTranscriptionEnabled
-            )
-            let requestContext = TranscriptionRequestContext(
-                language: language,
-                prompt: model.provider == .whisper ? UserDefaults.standard.string(forKey: "TranscriptionPrompt") : nil
-            )
+            let requestContext = Self.retranscriptionRequestContext(for: model, mode: mode)
             let modeName = (mode?.isEnabled == true) ? mode?.name : nil
             let modeEmoji = (mode?.isEnabled == true) ? mode?.icon.value : nil
 

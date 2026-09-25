@@ -1,7 +1,11 @@
 import Foundation
 
-enum MeetingRecordingWriterError: Error {
+enum MeetingRecordingWriterError: Error, Equatable {
     case cannotOpenFile
+    /// The file is not RIFF/WAVE at all - `found` is the leading ASCII the file actually carries.
+    case notWaveFile(found: String)
+    /// RIFF/WAVE, but its `fmt ` chunk is not stereo 16-bit PCM/float - `found` names what it is.
+    case unsupportedFormat(found: String)
 }
 
 /// Streams the whole-meeting recording (Toggle Meeting Capture start to stop) to disk as one
@@ -78,19 +82,89 @@ final class MeetingRecordingWriter {
         return Data(header)
     }
 
+    /// Where the stereo PCM frames live in a (possibly foreign-written) RIFF/WAVE file: files from
+    /// ffmpeg etc. carry extra chunks (`LIST`/`INFO`) before and/or after `data`, so the data chunk
+    /// must be found by walking chunks instead of assuming the writer's own 44-byte header.
+    struct WAVLayout: Equatable {
+        let dataOffset: Int
+        let dataByteCount: Int
+    }
+
+    /// Parses a RIFF/WAVE header and returns the `data` chunk's span. Verifies the `RIFF`/`WAVE`
+    /// magic, walks chunks (id + little-endian UInt32 size, odd sizes padded to even), and rejects
+    /// anything that is not stereo 16-bit PCM or IEEE float with a thrown error naming what was
+    /// found instead. Only the first few kilobytes are inspected; trailing audio is never touched.
+    static func parseWAVLayout(from url: URL) throws -> WAVLayout {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        guard let head = try handle.read(upToCount: 4096), head.count >= 12 else {
+            throw MeetingRecordingWriterError.notWaveFile(found: "file too short")
+        }
+        let bytes = [UInt8](head)
+
+        func ascii(_ range: Range<Int>) -> String {
+            String(bytes: bytes[range], encoding: .ascii) ?? "????"
+        }
+        func leUInt32(_ offset: Int) -> UInt32 {
+            UInt32(bytes[offset]) | UInt32(bytes[offset + 1]) << 8 | UInt32(bytes[offset + 2]) << 16 | UInt32(bytes[offset + 3]) << 24
+        }
+        func leUInt16(_ offset: Int) -> UInt16 {
+            UInt16(bytes[offset]) | UInt16(bytes[offset + 1]) << 8
+        }
+
+        guard ascii(0..<4) == "RIFF", ascii(8..<12) == "WAVE" else {
+            throw MeetingRecordingWriterError.notWaveFile(found: "leading bytes \"\(ascii(0..<min(4, bytes.count)))\"")
+        }
+
+        var format: (code: UInt16, channels: UInt16, bitsPerSample: UInt16)?
+        var offset = 12
+        while offset + 8 <= bytes.count {
+            let id = ascii(offset..<offset + 4)
+            let size = Int(leUInt32(offset + 4))
+            let content = offset + 8
+
+            if id == "fmt " {
+                guard content + 16 <= bytes.count else {
+                    throw MeetingRecordingWriterError.unsupportedFormat(found: "truncated fmt chunk")
+                }
+                format = (leUInt16(content), leUInt16(content + 2), leUInt16(content + 14))
+            } else if id == "data" {
+                guard let format else {
+                    throw MeetingRecordingWriterError.unsupportedFormat(found: "data chunk before fmt chunk")
+                }
+                guard [1, 3].contains(format.code), format.bitsPerSample == 16, format.channels == 2 else {
+                    throw MeetingRecordingWriterError.unsupportedFormat(
+                        found:
+                        "format code \(format.code), \(format.bitsPerSample)-bit, \(format.channels)-channel"
+                    )
+                }
+                // `size` governs; a truncated file just yields fewer frames (same as the old
+                // whole-file read's behaviour for a recording interrupted mid-write).
+                let fileEnd = Int((try? handle.seekToEnd()) ?? 0)
+                return WAVLayout(dataOffset: content, dataByteCount: min(size, max(0, fileEnd - content)))
+            }
+
+            // Odd-sized chunks carry one pad byte that is not counted in `size`.
+            offset = content + size + (size % 2)
+        }
+
+        throw MeetingRecordingWriterError.notWaveFile(found: "no data chunk")
+    }
+
     /// Reads a stereo WAV written by this type back into its two channels.
     static func readChannels(from url: URL) throws -> (mic: [Int16], system: [Int16]) {
         let data = try Data(contentsOf: url)
-        guard data.count > 44 else { return ([], []) }
+        let layout = try parseWAVLayout(from: url)
+        guard layout.dataByteCount >= 4 else { return ([], []) }
 
-        let frameCount = (data.count - 44) / 4
+        let frameCount = layout.dataByteCount / 4
         var mic = [Int16](repeating: 0, count: frameCount)
         var system = [Int16](repeating: 0, count: frameCount)
+        let base = data.startIndex + layout.dataOffset
         for i in 0..<frameCount {
-            let micOffset = 44 + i * 4
-            let systemOffset = micOffset + 2
+            let micOffset = base + i * 4
             mic[i] = data[micOffset..<micOffset + 2].withUnsafeBytes { $0.loadUnaligned(as: Int16.self) }
-            system[i] = data[systemOffset..<systemOffset + 2].withUnsafeBytes { $0.loadUnaligned(as: Int16.self) }
+            system[i] = data[micOffset + 2..<micOffset + 4].withUnsafeBytes { $0.loadUnaligned(as: Int16.self) }
         }
         return (mic, system)
     }
@@ -100,16 +174,24 @@ final class MeetingRecordingWriter {
     /// to process a long meeting a few minutes at a time instead of all at once.
     struct ChannelReader {
         private let handle: FileHandle
+        private let endOffset: UInt64
 
         init?(url: URL) {
-            guard let handle = FileHandle(forReadingAtPath: url.path) else { return nil }
+            guard
+                let handle = try? FileHandle(forReadingFrom: url),
+                let layout = try? MeetingRecordingWriter.parseWAVLayout(from: url)
+            else { return nil }
             self.handle = handle
-            try? handle.seek(toOffset: 44)
+            self.endOffset = UInt64(layout.dataOffset) + UInt64(layout.dataByteCount)
+            try? handle.seek(toOffset: UInt64(layout.dataOffset))
         }
 
-        /// The next up to `frameCount` stereo frames, or `nil` once the file is exhausted.
+        /// The next up to `frameCount` stereo frames, or `nil` once the data chunk is exhausted.
         func nextBlock(frameCount: Int) -> (mic: [Int16], system: [Int16])? {
-            guard let data = try? handle.read(upToCount: frameCount * 4), !data.isEmpty else { return nil }
+            let offset = (try? handle.offset()) ?? endOffset
+            let remainingFrames = Int(max(0, endOffset - offset)) / 4
+            guard remainingFrames > 0 else { return nil }
+            guard let data = try? handle.read(upToCount: min(frameCount, remainingFrames) * 4), !data.isEmpty else { return nil }
             let count = data.count / 4
             var mic = [Int16](repeating: 0, count: count)
             var system = [Int16](repeating: 0, count: count)
